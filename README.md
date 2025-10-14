@@ -1,5 +1,5 @@
 ---
-title: Example Leaderboard Template
+title: SWE Merge
 emoji: 🥇
 colorFrom: green
 colorTo: indigo
@@ -7,10 +7,10 @@ sdk: gradio
 app_file: app.py
 pinned: true
 license: apache-2.0
-short_description: Duplicate this leaderboard to initialize your own!
+short_description: Track AI coding agents by merged pull requests
 sdk_version: 5.43.1
 tags:
-  - leaderboard
+- leaderboard
 ---
 
 # Start the configuration
