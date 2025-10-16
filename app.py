@@ -32,8 +32,6 @@ LEADERBOARD_COLUMNS = [
     ("Total PRs", "number"),
     ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
-    ("First Contribution", "string"),
-    ("Last Updated", "string")
 ]
 
 # =============================================================================
@@ -209,51 +207,79 @@ def validate_github_username(identifier):
 
 def fetch_all_prs(identifier, token=None):
     """
-    Fetch all pull requests authored by a GitHub user.
-    Uses pagination to retrieve all results.
+    Fetch all pull requests associated with a GitHub user/bot.
+    Searches using multiple query patterns:
+    - is:pr author:{identifier} (authored by the user)
+    - is:pr head:{identifier}/ (branch names starting with identifier)
+    - is:pr "Co-Authored-By: {identifier}" (co-authored commits)
+
+    Uses pagination to retrieve all results and deduplicates by PR ID.
     """
     headers = {'Authorization': f'token {token}'} if token else {}
-    all_prs = []
-    page = 1
-    per_page = 100
-    
-    while True:
-        url = f'https://api.github.com/search/issues'
-        params = {
-            'q': f'is:pr author:{identifier}',
-            'per_page': per_page,
-            'page': page
-        }
 
-        try:
-            response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=6)
-            if response is None:
-                print(f"Error fetching PRs for {identifier}: retries exhausted")
+    # Define all query patterns to search
+    query_patterns = [
+        # f'is:pr author:{identifier}',
+        f'is:pr head:{identifier}/',
+        # f'is:pr "Co-Authored-By: {identifier}"'
+    ]
+
+    # Use a dict to deduplicate PRs by ID
+    prs_by_id = {}
+
+    for query in query_patterns:
+        print(f"Searching with query: {query}")
+        page = 1
+        per_page = 100
+
+        while True:
+            url = f'https://api.github.com/search/issues'
+            params = {
+                'q': query,
+                'per_page': per_page,
+                'page': page
+            }
+
+            try:
+                response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=6)
+                if response is None:
+                    print(f"Error fetching PRs for query '{query}': retries exhausted")
+                    break
+
+                if response.status_code != 200:
+                    print(f"Error fetching PRs for query '{query}': HTTP {response.status_code}")
+                    break
+
+                data = response.json()
+                items = data.get('items', [])
+
+                if not items:
+                    break
+
+                # Add PRs to dict, using ID as key to avoid duplicates
+                for pr in items:
+                    pr_id = pr.get('id')
+                    if pr_id and pr_id not in prs_by_id:
+                        prs_by_id[pr_id] = pr
+
+                # Check if there are more pages
+                if len(items) < per_page:
+                    break
+
+                page += 1
+                time.sleep(0.5)  # Courtesy delay between pages
+
+            except Exception as e:
+                print(f"Error fetching PRs for query '{query}': {str(e)}")
                 break
 
-            if response.status_code != 200:
-                print(f"Error fetching PRs for {identifier}: HTTP {response.status_code}")
-                break
+        # Delay between different query patterns
+        time.sleep(0.5)
 
-            data = response.json()
-            items = data.get('items', [])
+    # Convert dict back to list
+    all_prs = list(prs_by_id.values())
+    print(f"Found {len(all_prs)} unique PRs for {identifier}")
 
-            if not items:
-                break
-
-            all_prs.extend(items)
-
-            # Check if there are more pages
-            if len(items) < per_page:
-                break
-
-            page += 1
-            time.sleep(0.5)  # Courtesy delay between pages
-
-        except Exception as e:
-            print(f"Error fetching PRs for {identifier}: {str(e)}")
-            break
-    
     return all_prs
 
 
@@ -265,9 +291,6 @@ def calculate_pr_stats(prs):
     total_prs = len(prs)
     merged = 0
     repos = set()
-    prs_by_repo = defaultdict(int)
-    first_contribution = None
-    last_contribution = None
     
     for pr in prs:
         # Track repository information
@@ -275,16 +298,7 @@ def calculate_pr_stats(prs):
         if repo_url:
             repo_name = '/'.join(repo_url.split('/')[-2:])
             repos.add(repo_name)
-            prs_by_repo[repo_name] += 1
-        
-        # Track contribution timeline
-        created_at = pr.get('created_at')
-        if created_at:
-            if not first_contribution or created_at < first_contribution:
-                first_contribution = created_at
-            if not last_contribution or created_at > last_contribution:
-                last_contribution = created_at
-        
+
         # Track PR status
         state = pr.get('state')
         if state == 'closed':
@@ -298,9 +312,6 @@ def calculate_pr_stats(prs):
         'total_prs': total_prs,
         'merged': merged,
         'acceptance_rate': round(acceptance_rate, 2),
-        'first_contribution': first_contribution or 'N/A',
-        'last_contribution': last_contribution or 'N/A',
-        'prs_by_repo': dict(prs_by_repo)
     }
 
 
@@ -313,7 +324,6 @@ def fetch_agent_stats(identifier, token=None):
     prs = fetch_all_prs(identifier, token)
     stats = calculate_pr_stats(prs)
     stats['identifier'] = identifier
-    stats['last_updated'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     return stats
 
 
@@ -331,7 +341,6 @@ def load_submissions_dataset():
                 'agent_name': row.get('agent_name', 'Unknown'),
                 'identifier': row.get('identifier'),
                 'organization': row.get('organization', 'Unknown'),
-                'description': row.get('description', ''),
             })
         print(f"✓ Loaded {len(submissions)} submissions from HuggingFace")
         return submissions
@@ -479,9 +488,8 @@ def update_all_agents():
             # Merge metadata with stats
             cache_dict[identifier] = {
                 'agent_name': agent.get('agent_name', 'Unknown'),
-                'identifier': identifier,
                 'organization': agent.get('organization', 'Unknown'),
-                'description': agent.get('description', ''),
+                'identifier': identifier,
                 **stats
             }
             
@@ -554,12 +562,9 @@ def get_leaderboard_dataframe():
         rows.append([
             data.get('agent_name', 'Unknown'),
             data.get('organization', 'Unknown'),
-            identifier,
             data.get('total_prs', 0),
             data.get('merged', 0),
             data.get('acceptance_rate', 0.0),
-            normalize_date_format(data.get('first_contribution', 'N/A')),
-            normalize_date_format(data.get('last_updated', 'N/A'))
         ])
     
     # Create DataFrame
@@ -593,7 +598,7 @@ def refresh_leaderboard():
         return error_msg, get_leaderboard_dataframe()
 
 
-def submit_agent(identifier, agent_name, organization, description):
+def submit_agent(identifier, agent_name, organization, description, website):
     """
     Submit a new agent to the leaderboard.
     Validates input, saves submission, and fetches PR data.
@@ -605,13 +610,16 @@ def submit_agent(identifier, agent_name, organization, description):
         return "❌ Agent name is required", get_leaderboard_dataframe()
     if not organization or not organization.strip():
         return "❌ Organization name is required", get_leaderboard_dataframe()
-    
+    if not website or not website.strip():
+        return "❌ Website URL is required", get_leaderboard_dataframe()
+
     # Clean inputs
     identifier = identifier.strip()
     agent_name = agent_name.strip()
     organization = organization.strip()
-    description = description.strip() if description else ""
-    
+    description = description.strip()
+    website = website.strip()
+
     # Validate GitHub username
     is_valid, message = validate_github_username(identifier)
     if not is_valid:
@@ -627,9 +635,10 @@ def submit_agent(identifier, agent_name, organization, description):
     # Create submission
     submission = {
         'agent_name': agent_name,
-        'identifier': identifier,
         'organization': organization,
+        'identifier': identifier,
         'description': description,
+        'website': website,
     }
     
     # Save to HuggingFace
@@ -714,7 +723,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Organization"],
-                filter_columns=["Total PRs", "Acceptance Rate (%)"]
+                filter_columns=["Acceptance Rate (%)", "Merged PRs"]
             )
             
             refresh_button.click(
@@ -749,6 +758,10 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                         placeholder="Brief description of your agent",
                         lines=3
                     )
+                    website_input = gr.Textbox(
+                        label="Website",
+                        placeholder="https://example.com"
+                    )
             
             submit_button = gr.Button(
                 "Submit Agent",
@@ -762,7 +775,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
             # Event handler
             submit_button.click(
                 fn=submit_agent,
-                inputs=[github_input, name_input, organization_input, description_input],
+                inputs=[github_input, name_input, organization_input, description_input, website_input],
                 outputs=[submission_status, leaderboard_table]
             )
 
