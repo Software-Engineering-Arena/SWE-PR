@@ -399,8 +399,8 @@ def load_leaderboard_dataset():
         return None
 
 
-def save_submission_to_hf(data):
-    """Save a new submission to HuggingFace dataset."""
+def save_agent_to_hf(data):
+    """Save a new agent to HuggingFace dataset."""
     try:
         api = HfApi()
         token = HfFolder.get_token()
@@ -669,7 +669,7 @@ def submit_agent(identifier, agent_name, organization, description, website):
     }
     
     # Save to HuggingFace
-    if not save_submission_to_hf(submission):
+    if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe()
     
     # Add to local metadata
