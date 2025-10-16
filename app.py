@@ -355,8 +355,8 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     Uses time-based partitioning to bypass GitHub's 1000-result limit per query.
     Searches using multiple query patterns:
     - is:pr author:{identifier} (authored by the user)
-    - is:pr head:{identifier}/ (branch names starting with identifier)
     - is:pr "co-authored-by: {identifier}" (co-authored commits)
+    - is:pr head:{identifier}/ (branch names starting with identifier)
 
     Args:
         identifier: GitHub username/bot identifier
@@ -379,8 +379,8 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     # Define all query patterns to search
     query_patterns = [
         f'is:pr author:{identifier}',
+        f'is:pr "co-authored-by: {identifier}"',
         f'is:pr head:{identifier}/',
-        f'is:pr "co-authored-by: {identifier}"'
     ]
 
     # Use a dict to deduplicate PRs by ID
