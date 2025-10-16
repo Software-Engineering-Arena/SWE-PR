@@ -4,7 +4,7 @@ import json
 import os
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from huggingface_hub import HfApi, hf_hub_download
 from datasets import load_dataset, Dataset
@@ -12,17 +12,37 @@ import threading
 from dotenv import load_dotenv
 import pandas as pd
 import random
+import argparse
 
 # Load environment variables
 load_dotenv()
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='SWE Agent PR Leaderboard')
+parser.add_argument('--debug', '--DEBUG', action='store_true',
+                    help='Enable debug mode (limits PR retrieval to 10 per query pattern)')
+parser.add_argument('--no-debug', '--production', action='store_true',
+                    help='Explicitly disable debug mode (force production mode)')
+args = parser.parse_args()
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
+# DEBUG MODE: Set to True to limit PR retrieval for testing
+# When enabled, only fetches up to 10 PRs per query pattern per agent
+# Priority: 1) Command-line args, 2) Environment variable, 3) Default (False)
+if args.no_debug:
+    DEBUG_MODE = False
+elif args.debug:
+    DEBUG_MODE = True
+else:
+    DEBUG_MODE = os.getenv('DEBUG_MODE', 'False').lower() in ('true', '1', 'yes')
+
 CACHE_FILE = "agent_pr_cache.jsonl"
 AGENTS_REPO = "SWE-Arena/pr_agents"  # HuggingFace dataset for agent metadata
 LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
+PR_METADATA_REPO = "SWE-Arena/pr_metadata"  # HuggingFace dataset for PR metadata
 UPDATE_INTERVAL = 86400  # 24 hours in seconds
 
 LEADERBOARD_COLUMNS = [
@@ -31,7 +51,6 @@ LEADERBOARD_COLUMNS = [
     ("Total PRs", "number"),
     ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
-    ("Median Merge Duration (minutes)", "number"),
 ]
 
 # =============================================================================
@@ -191,7 +210,7 @@ def validate_github_username(identifier):
         token = get_github_token()
         headers = {'Authorization': f'token {token}'} if token else {}
         url = f'https://api.github.com/users/{identifier}'
-        response = request_with_backoff('GET', url, headers=headers, max_retries=6)
+        response = request_with_backoff('GET', url, headers=headers, max_retries=1)
         if response is None:
             return False, "Validation error: network/rate limit exhausted"
         if response.status_code == 200:
@@ -204,17 +223,150 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_all_prs(identifier, token=None):
+def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None):
     """
-    Fetch all pull requests associated with a GitHub user/bot.
+    Fetch PRs within a specific time range using time-based partitioning.
+    Recursively splits the time range if hitting the 1000-result limit.
+
+    Args:
+        debug_limit: If set, stops fetching after this many PRs (for testing)
+
+    Returns the number of PRs found in this time partition.
+    """
+    # Format dates for GitHub search (YYYY-MM-DD)
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+
+    # Add date range to query
+    query = f'{base_query} created:{start_str}..{end_str}'
+
+    print(f"  Searching range {start_str} to {end_str}...")
+
+    page = 1
+    per_page = 100
+    total_in_partition = 0
+
+    while True:
+        # Check debug limit
+        if debug_limit is not None and total_in_partition >= debug_limit:
+            print(f"    🐛 DEBUG MODE: Reached limit of {debug_limit} PRs, stopping...")
+            return total_in_partition
+        url = 'https://api.github.com/search/issues'
+        params = {
+            'q': query,
+            'per_page': per_page,
+            'page': page,
+            'sort': 'created',
+            'order': 'asc'
+        }
+
+        try:
+            response = request_with_backoff('GET', url, headers=headers, params=params)
+            if response is None:
+                print(f"    Error: retries exhausted for range {start_str} to {end_str}")
+                return total_in_partition
+
+            if response.status_code != 200:
+                print(f"    Error: HTTP {response.status_code} for range {start_str} to {end_str}")
+                return total_in_partition
+
+            data = response.json()
+            total_count = data.get('total_count', 0)
+            items = data.get('items', [])
+
+            if not items:
+                break
+
+            # Add PRs to global dict
+            for pr in items:
+                pr_id = pr.get('id')
+                if pr_id and pr_id not in prs_by_id:
+                    prs_by_id[pr_id] = pr
+                    total_in_partition += 1
+
+            # Check if we hit the 1000-result limit
+            if total_count > 1000 and page == 10:
+                print(f"    ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
+
+                # Calculate midpoint
+                time_diff = end_date - start_date
+                mid_date = start_date + time_diff / 2
+
+                # Recursively fetch both halves
+                count1 = fetch_prs_with_time_partition(base_query, start_date, mid_date, headers, prs_by_id, debug_limit)
+                count2 = fetch_prs_with_time_partition(base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit)
+
+                return count1 + count2
+
+            # Normal pagination: check if there are more pages
+            if len(items) < per_page or page >= 10:
+                break
+
+            page += 1
+            time.sleep(0.5)  # Courtesy delay between pages
+
+        except Exception as e:
+            print(f"    Error fetching range {start_str} to {end_str}: {str(e)}")
+            return total_in_partition
+
+    if total_in_partition > 0:
+        print(f"    ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
+
+    return total_in_partition
+
+
+def extract_pr_metadata(pr, agent_name):
+    """
+    Extract minimal PR metadata for efficient storage.
+    Only keeps essential fields: html_url, created_at, merged_at, closed_at, agent_name.
+    """
+    pull_request = pr.get('pull_request', {})
+
+    # Extract dates
+    created_at = pr.get('created_at')
+    merged_at = pull_request.get('merged_at')
+    closed_at = pr.get('closed_at')
+
+    # Only store closed_at if PR is closed but not merged
+    if merged_at:
+        closed_at = None  # Don't store redundant info
+
+    return {
+        'html_url': pr.get('html_url'),
+        'created_at': created_at,
+        'merged_at': merged_at,
+        'closed_at': closed_at,
+        'agent_name': agent_name
+    }
+
+
+def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None):
+    """
+    Fetch ALL pull requests associated with a GitHub user/bot.
+    Returns lightweight metadata instead of full PR objects.
+
+    Uses time-based partitioning to bypass GitHub's 1000-result limit per query.
     Searches using multiple query patterns:
     - is:pr author:{identifier} (authored by the user)
     - is:pr head:{identifier}/ (branch names starting with identifier)
     - is:pr "co-authored-by: {identifier}" (co-authored commits)
 
-    Uses pagination to retrieve all results and deduplicates by PR ID.
+    Args:
+        identifier: GitHub username/bot identifier
+        agent_name: Human-readable agent name for metadata
+        token: GitHub API token
+        start_from_date: Only fetch PRs created after this date (for incremental updates)
+
+    Returns:
+        List of minimal PR metadata dictionaries
     """
     headers = {'Authorization': f'token {token}'} if token else {}
+
+    # Debug mode: limit PR retrieval for testing
+    debug_limit_per_pattern = 10 if DEBUG_MODE else None
+
+    if DEBUG_MODE:
+        print(f"\n🐛 DEBUG MODE ENABLED: Limiting to {debug_limit_per_pattern} PRs per query pattern")
 
     # Define all query patterns to search
     query_patterns = [
@@ -226,129 +378,256 @@ def fetch_all_prs(identifier, token=None):
     # Use a dict to deduplicate PRs by ID
     prs_by_id = {}
 
-    for query in query_patterns:
-        print(f"Searching with query: {query}")
-        page = 1
-        per_page = 100
+    # Define time range: start from specified date or GitHub founding
+    start_date = start_from_date or datetime(2008, 1, 1, tzinfo=timezone.utc)
+    end_date = datetime.now(timezone.utc)
 
-        while True:
-            url = f'https://api.github.com/search/issues'
-            params = {
-                'q': query,
-                'per_page': per_page,
-                'page': page
-            }
+    for query_pattern in query_patterns:
+        print(f"\n🔍 Searching with query: {query_pattern}")
+        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
-            try:
-                response = request_with_backoff('GET', url, headers=headers, params=params)
-                if response is None:
-                    print(f"Error fetching PRs for query '{query}': retries exhausted")
-                    break
+        pattern_start_time = time.time()
+        initial_count = len(prs_by_id)
 
-                if response.status_code != 200:
-                    print(f"Error fetching PRs for query '{query}': HTTP {response.status_code}")
-                    break
+        # Fetch with time partitioning
+        prs_found = fetch_prs_with_time_partition(
+            query_pattern,
+            start_date,
+            end_date,
+            headers,
+            prs_by_id,
+            debug_limit_per_pattern
+        )
 
-                data = response.json()
-                items = data.get('items', [])
+        pattern_duration = time.time() - pattern_start_time
+        new_prs = len(prs_by_id) - initial_count
 
-                if not items:
-                    break
+        print(f"   ✓ Pattern complete: {new_prs} new PRs found ({prs_found} total fetched, {len(prs_by_id) - initial_count - (prs_found - new_prs)} duplicates)")
+        print(f"   ⏱️ Time taken: {pattern_duration:.1f} seconds")
 
-                # Add PRs to dict, using ID as key to avoid duplicates
-                for pr in items:
-                    pr_id = pr.get('id')
-                    if pr_id and pr_id not in prs_by_id:
-                        prs_by_id[pr_id] = pr
+        # Delay between different query patterns (shorter in debug mode)
+        time.sleep(0.2 if DEBUG_MODE else 1.0)
 
-                # Check if there are more pages
-                if len(items) < per_page:
-                    break
-
-                page += 1
-                time.sleep(0.5)  # Courtesy delay between pages
-
-            except Exception as e:
-                print(f"Error fetching PRs for query '{query}': {str(e)}")
-                break
-
-        # Delay between different query patterns
-        time.sleep(0.5)
-
-    # Convert dict back to list
+    # Convert to lightweight metadata
     all_prs = list(prs_by_id.values())
-    print(f"Found {len(all_prs)} unique PRs for {identifier}")
+    if DEBUG_MODE:
+        print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_prs)} unique PRs for {identifier}")
+        print(f"   Note: In production mode, this would fetch ALL PRs")
+    else:
+        print(f"\n✅ COMPLETE: Found {len(all_prs)} unique PRs for {identifier}")
+    print(f"📦 Extracting minimal metadata...")
 
-    return all_prs
+    metadata_list = [extract_pr_metadata(pr, agent_name) for pr in all_prs]
+
+    # Calculate memory savings
+    import sys
+    original_size = sys.getsizeof(str(all_prs))
+    metadata_size = sys.getsizeof(str(metadata_list))
+    savings_pct = ((original_size - metadata_size) / original_size * 100) if original_size > 0 else 0
+
+    print(f"💾 Memory efficiency: {original_size // 1024}KB → {metadata_size // 1024}KB (saved {savings_pct:.1f}%)")
+
+    return metadata_list
 
 
-def calculate_pr_stats(prs):
+def calculate_pr_stats_from_metadata(metadata_list):
     """
-    Calculate statistics from a list of pull requests.
+    Calculate statistics from a list of PR metadata (lightweight objects).
+    Works with minimal metadata: html_url, created_at, merged_at, closed_at, agent_name.
+
     Returns a dictionary with comprehensive PR metrics.
-    """
-    total_prs = len(prs)
-    merged = 0
-    repos = set()
-    merged_times = []  # Store merged times in minutes for merged PRs
-    
-    for pr in prs:
-        # Track repository information
-        repo_url = pr.get('repository_url', '')
-        if repo_url:
-            repo_name = '/'.join(repo_url.split('/')[-2:])
-            repos.add(repo_name)
 
-        # Track PR status
-        state = pr.get('state')
-        if state == 'closed':
-            pull_request = pr.get('pull_request', {})
-            merged_at = pull_request.get('merged_at')
-            if merged_at:
-                merged += 1
-                
-                # Calculate merged time (creation to merge)
-                try:
-                    created_at = pr.get('created_at')
-                    if created_at and merged_at:
-                        created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                        merged_dt = datetime.fromisoformat(merged_at.replace('Z', '+00:00'))
-                        merged_time_minutes = (merged_dt - created_dt).total_seconds() / 60  # Convert to minutes
-                        merged_times.append(merged_time_minutes)
-                except Exception as e:
-                    print(f"Warning: Could not calculate merged time for PR: {e}")
-    
-    acceptance_rate = (merged / total_prs * 100) if total_prs > 0 else 0
-    
-    # Calculate median merged time
-    median_merged_time = None
-    if merged_times:
-        merged_times.sort()
-        n = len(merged_times)
-        if n % 2 == 0:
-            median_merged_time = (merged_times[n // 2 - 1] + merged_times[n // 2]) / 2
-        else:
-            median_merged_time = merged_times[n // 2]
-        median_merged_time = round(median_merged_time, 2)
-    
+    Acceptance rate is calculated as:
+        merged PRs / (merged PRs + closed but not merged PRs) * 100
+
+    This only counts PRs where a decision has been made (either merged or rejected/closed).
+    """
+    total_prs = len(metadata_list)
+    merged = sum(1 for pr_meta in metadata_list if pr_meta.get('merged_at'))
+
+    # Count closed PRs (rejected) - those with closed_at but no merged_at
+    closed_not_merged = sum(1 for pr_meta in metadata_list
+                           if pr_meta.get('closed_at') and not pr_meta.get('merged_at'))
+
+    # Total decisions made = merged + closed (rejected)
+    total_decisions = merged + closed_not_merged
+
+    # Calculate acceptance rate based on decisions made
+    acceptance_rate = (merged / total_decisions * 100) if total_decisions > 0 else 0
+
     return {
         'total_prs': total_prs,
         'merged': merged,
         'acceptance_rate': round(acceptance_rate, 2),
-        'median_merged_time': median_merged_time,
     }
 
 
-def fetch_agent_stats(identifier, token=None):
+# =============================================================================
+# PR METADATA STORAGE & RETRIEVAL
+# =============================================================================
+
+def group_metadata_by_year_month(metadata_list):
     """
-    Fetch and calculate PR statistics for a single agent.
-    Returns dictionary with all stats and metadata.
+    Group PR metadata by year.month for efficient storage.
+    Returns dict: {(year, month): [metadata_list]}
     """
-    print(f"Fetching data for {identifier}...")
-    prs = fetch_all_prs(identifier, token)
-    stats = calculate_pr_stats(prs)
-    stats['github_identifier'] = identifier
-    return stats
+    grouped = defaultdict(list)
+
+    for pr_meta in metadata_list:
+        created_at = pr_meta.get('created_at')
+        if not created_at:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            key = (dt.year, dt.month)
+            grouped[key].append(pr_meta)
+        except Exception as e:
+            print(f"Warning: Could not parse date '{created_at}': {e}")
+
+    return dict(grouped)
+
+
+def save_pr_metadata_to_hf(metadata_list):
+    """
+    Save PR metadata to HuggingFace dataset, organized by year.month.
+    Each file is named YYYY.MM.jsonl and contains all PRs created in that month.
+
+    This function APPENDS new metadata and DEDUPLICATES by html_url.
+    """
+    try:
+        token = get_hf_token()
+        if not token:
+            raise Exception("No HuggingFace token found")
+
+        api = HfApi()
+
+        # Group by year.month
+        grouped = group_metadata_by_year_month(metadata_list)
+
+        for (year, month), month_metadata in grouped.items():
+            filename = f"{year}.{month:02d}.jsonl"
+            print(f"📤 Uploading {len(month_metadata)} PRs to {filename}...")
+
+            # Download existing file if it exists
+            existing_metadata = []
+            try:
+                file_path = hf_hub_download(
+                    repo_id=PR_METADATA_REPO,
+                    filename=filename,
+                    repo_type="dataset",
+                    token=token
+                )
+                existing_metadata = load_jsonl(file_path)
+                print(f"   Found {len(existing_metadata)} existing PRs in {filename}")
+            except Exception:
+                print(f"   No existing file found for {filename}, creating new")
+
+            # Merge and deduplicate by html_url
+            existing_by_url = {meta['html_url']: meta for meta in existing_metadata if meta.get('html_url')}
+            new_by_url = {meta['html_url']: meta for meta in month_metadata if meta.get('html_url')}
+
+            # Update with new data (new data overwrites old)
+            existing_by_url.update(new_by_url)
+            merged_metadata = list(existing_by_url.values())
+
+            # Save locally
+            save_jsonl(filename, merged_metadata)
+
+            # Upload to HuggingFace
+            api.upload_file(
+                path_or_fileobj=filename,
+                path_in_repo=filename,
+                repo_id=PR_METADATA_REPO,
+                repo_type="dataset",
+                token=token
+            )
+
+            # Clean up local file
+            os.remove(filename)
+
+            print(f"   ✓ Saved {len(merged_metadata)} total PRs to {filename}")
+
+        return True
+
+    except Exception as e:
+        print(f"✗ Error saving PR metadata: {str(e)}")
+        return False
+
+
+def load_pr_metadata_for_year(year):
+    """
+    Load all PR metadata for a specific year from HuggingFace.
+    Returns list of all PR metadata from that year.
+    """
+    try:
+        api = HfApi()
+        token = get_hf_token()
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
+
+        # Filter for files matching the year pattern (e.g., 2025.01.jsonl, 2025.02.jsonl)
+        year_pattern = f"{year}."
+        year_files = [f for f in files if f.startswith(year_pattern) and f.endswith('.jsonl')]
+
+        print(f"📥 Loading PR metadata for {year} ({len(year_files)} files)...")
+
+        all_metadata = []
+        for filename in year_files:
+            try:
+                file_path = hf_hub_download(
+                    repo_id=PR_METADATA_REPO,
+                    filename=filename,
+                    repo_type="dataset",
+                    token=token
+                )
+                month_metadata = load_jsonl(file_path)
+                all_metadata.extend(month_metadata)
+                print(f"   ✓ Loaded {len(month_metadata)} PRs from {filename}")
+            except Exception as e:
+                print(f"   Warning: Could not load {filename}: {str(e)}")
+
+        print(f"✓ Loaded {len(all_metadata)} total PRs for {year}")
+        return all_metadata
+
+    except Exception as e:
+        print(f"✗ Error loading PR metadata for {year}: {str(e)}")
+        return []
+
+
+def get_latest_pr_date_for_agent(agent_name, current_year):
+    """
+    Get the latest PR creation date for an agent from stored metadata.
+    Used for incremental updates - only fetch PRs newer than this date.
+
+    Returns datetime or None if no existing PRs found.
+    """
+    try:
+        metadata = load_pr_metadata_for_year(current_year)
+
+        # Filter for this agent
+        agent_prs = [pr for pr in metadata if pr.get('agent_name') == agent_name]
+
+        if not agent_prs:
+            return None
+
+        # Find latest created_at
+        latest_date = None
+        for pr in agent_prs:
+            created_at = pr.get('created_at')
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    if latest_date is None or dt > latest_date:
+                        latest_date = dt
+                except Exception:
+                    continue
+
+        return latest_date
+
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -503,12 +782,20 @@ def save_leaderboard_to_hf(cache_dict):
 # DATA MANAGEMENT
 # =============================================================================
 
-def update_all_agents():
+def update_all_agents_incremental():
     """
-    Update PR statistics for all agents from HuggingFace dataset.
+    Memory-efficient incremental update of PR statistics for all agents.
+
+    Strategy:
+    1. For each agent, check latest PR date from stored metadata
+    2. Only fetch NEW PRs created after that date
+    3. Store minimal metadata (not full PR objects) to avoid storage limits
+    4. Construct leaderboard from stored metadata
+
     Returns dictionary of all agent data with current stats.
     """
     token = get_github_token()
+    current_year = datetime.now().year
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -523,17 +810,54 @@ def update_all_agents():
     # Update each agent
     for agent in agents:
         identifier = agent.get('github_identifier')
+        agent_name = agent.get('agent_name', 'Unknown')
+
         if not identifier:
             print(f"Warning: Skipping agent without identifier: {agent}")
             continue
 
         try:
-            # Fetch fresh PR statistics
-            stats = fetch_agent_stats(identifier, token)
+            print(f"\n{'='*80}")
+            print(f"Processing: {agent_name} ({identifier})")
+            print(f"{'='*80}")
+
+            # Check for existing metadata to determine incremental update date
+            latest_pr_date = get_latest_pr_date_for_agent(agent_name, current_year)
+
+            if latest_pr_date:
+                print(f"📅 Latest PR found: {latest_pr_date.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Fetching only PRs created after this date...")
+                start_from = latest_pr_date + timedelta(seconds=1)  # Start 1 second after
+            else:
+                print(f"📅 No existing PRs found. Fetching all PR metadata...")
+                start_from = None
+
+            # Fetch PR metadata (lightweight, memory-efficient)
+            new_metadata = fetch_all_prs_metadata(
+                identifier,
+                agent_name,
+                token,
+                start_from_date=start_from
+            )
+
+            if new_metadata:
+                # Save new metadata to HuggingFace (organized by year.month)
+                print(f"💾 Saving {len(new_metadata)} new PR records...")
+                save_pr_metadata_to_hf(new_metadata)
+
+            # Load all metadata for current year to calculate stats
+            print(f"📊 Calculating statistics from stored metadata...")
+            all_year_metadata = load_pr_metadata_for_year(current_year)
+
+            # Filter for this specific agent
+            agent_metadata = [pr for pr in all_year_metadata if pr.get('agent_name') == agent_name]
+
+            # Calculate stats from metadata
+            stats = calculate_pr_stats_from_metadata(agent_metadata)
 
             # Merge metadata with stats
             cache_dict[identifier] = {
-                'agent_name': agent.get('agent_name', 'Unknown'),
+                'agent_name': agent_name,
                 'organization': agent.get('organization', 'Unknown'),
                 'github_identifier': identifier,
                 **stats
@@ -541,11 +865,54 @@ def update_all_agents():
 
             # Progressive save
             save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
-            print(f"✓ Updated {identifier}")
+            print(f"✓ Updated {identifier}: {stats['total_prs']} PRs, {stats['acceptance_rate']}% acceptance")
 
         except Exception as e:
             print(f"✗ Error updating {identifier}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             continue
+
+    return cache_dict
+
+
+def construct_leaderboard_from_metadata():
+    """
+    Construct leaderboard from stored PR metadata instead of fetching all PRs.
+    Much more memory-efficient and faster.
+
+    Returns dictionary of agent stats.
+    """
+    print("📊 Constructing leaderboard from PR metadata...")
+    current_year = datetime.now().year
+
+    # Load agents
+    agents = load_agents_from_hf()
+    if not agents:
+        print("No agents found")
+        return {}
+
+    # Load all PR metadata for current year
+    all_metadata = load_pr_metadata_for_year(current_year)
+
+    cache_dict = {}
+
+    for agent in agents:
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('agent_name', 'Unknown')
+
+        # Filter metadata for this agent
+        agent_metadata = [pr for pr in all_metadata if pr.get('agent_name') == agent_name]
+
+        # Calculate stats
+        stats = calculate_pr_stats_from_metadata(agent_metadata)
+
+        cache_dict[identifier] = {
+            'agent_name': agent_name,
+            'organization': agent.get('organization', 'Unknown'),
+            'github_identifier': identifier,
+            **stats
+        }
 
     return cache_dict
 
@@ -553,7 +920,7 @@ def update_all_agents():
 def initialize_data():
     """
     Initialize data on application startup.
-    Priority: Leaderboard dataset > HuggingFace agents dataset
+    Priority: 1) Leaderboard dataset, 2) PR metadata (if available), 3) Full GitHub mining
     """
     print("🚀 Initializing leaderboard data...")
 
@@ -564,12 +931,23 @@ def initialize_data():
         print("✓ Initialized from leaderboard dataset")
         return
 
-    # Try loading agents from HuggingFace and mining GitHub data
+    # Try constructing from PR metadata (fast, memory-efficient)
+    try:
+        cache_dict = construct_leaderboard_from_metadata()
+        if cache_dict:
+            save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
+            save_leaderboard_to_hf(cache_dict)
+            print("✓ Initialized from PR metadata")
+            return
+    except Exception as e:
+        print(f"Could not construct from metadata: {e}")
+
+    # Fallback: Full incremental mining from GitHub
     agents = load_agents_from_hf()
     if agents:
         print(f"✓ Loaded {len(agents)} agents from HuggingFace")
-        print("⛏️ Mining GitHub data...")
-        cache_dict = update_all_agents()
+        print("⛏️ Mining GitHub data (this may take a while)...")
+        cache_dict = update_all_agents_incremental()
         if cache_dict:
             save_leaderboard_to_hf(cache_dict)
         return
@@ -601,7 +979,6 @@ def get_leaderboard_dataframe():
             data.get('total_prs', 0),
             data.get('merged', 0),
             data.get('acceptance_rate', 0.0),
-            data.get('median_merged_time', None),
         ])
     
     # Create DataFrame
@@ -609,7 +986,7 @@ def get_leaderboard_dataframe():
     df = pd.DataFrame(rows, columns=column_names)
     
     # Ensure numeric types
-    numeric_cols = ["Total PRs", "Merged PRs", "Acceptance Rate (%)", "Median Merge Duration (minutes)"]
+    numeric_cols = ["Total PRs", "Merged PRs", "Acceptance Rate (%)"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -622,10 +999,10 @@ def get_leaderboard_dataframe():
 
 
 def refresh_leaderboard():
-    """Manually trigger data refresh for all agents."""
+    """Manually trigger data refresh for all agents using incremental updates."""
     try:
-        print("🔄 Manual refresh initiated")
-        cache_dict = update_all_agents()
+        print("🔄 Manual refresh initiated (incremental mode)")
+        cache_dict = update_all_agents_incremental()
         if cache_dict:
             save_leaderboard_to_hf(cache_dict)
         return "✅ Data refreshed successfully!", get_leaderboard_dataframe()
@@ -638,7 +1015,7 @@ def refresh_leaderboard():
 def submit_agent(identifier, agent_name, organization, description, website):
     """
     Submit a new agent to the leaderboard.
-    Validates input, saves submission, and fetches PR data.
+    Validates input, saves submission, and fetches PR metadata (memory-efficient).
     """
     # Validate required fields
     if not identifier or not identifier.strip():
@@ -681,26 +1058,38 @@ def submit_agent(identifier, agent_name, organization, description, website):
     # Save to HuggingFace
     if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe()
-    
-    # Fetch PR data immediately
+
+    # Fetch PR metadata immediately (memory-efficient)
     token = get_github_token()
     try:
-        stats = fetch_agent_stats(identifier, token)
-        
+        print(f"Fetching PR metadata for {agent_name}...")
+
+        # Fetch lightweight metadata
+        metadata_list = fetch_all_prs_metadata(identifier, agent_name, token)
+
+        if metadata_list:
+            # Save metadata to HuggingFace
+            save_pr_metadata_to_hf(metadata_list)
+
+        # Calculate stats from metadata
+        stats = calculate_pr_stats_from_metadata(metadata_list)
+
         # Update cache
         cache_list = load_jsonl(CACHE_FILE)
         cache_dict = cache_to_dict(cache_list)
         cache_dict[identifier] = {**submission, **stats}
         save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
-        
+
         # Save to HuggingFace
         save_leaderboard_to_hf(cache_dict)
-        
+
         return f"✅ Successfully submitted {agent_name}!", get_leaderboard_dataframe()
-        
+
     except Exception as e:
         error_msg = f"⚠️ Submitted {agent_name}, but failed to fetch PR data: {str(e)}"
         print(error_msg)
+        import traceback
+        traceback.print_exc()
         return error_msg, get_leaderboard_dataframe()
 
 
@@ -709,17 +1098,24 @@ def submit_agent(identifier, agent_name, organization, description, website):
 # =============================================================================
 
 def scheduled_update_task():
-    """Background daemon thread for periodic data updates."""
+    """
+    Background daemon thread for periodic incremental data updates.
+    Uses memory-efficient incremental fetching to avoid storage eviction.
+    """
     while True:
         time.sleep(UPDATE_INTERVAL)
-        print(f"\n🔄 Scheduled update started at {datetime.now().isoformat()}")
+        print(f"\n{'='*80}")
+        print(f"🔄 Scheduled incremental update started at {datetime.now().isoformat()}")
+        print(f"{'='*80}")
         try:
-            cache_dict = update_all_agents()
+            cache_dict = update_all_agents_incremental()
             if cache_dict:
                 save_leaderboard_to_hf(cache_dict)
-            print("✓ Scheduled update completed")
+            print("✓ Scheduled update completed successfully")
         except Exception as e:
             print(f"✗ Scheduled update failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 
 # =============================================================================
@@ -727,6 +1123,27 @@ def scheduled_update_task():
 # =============================================================================
 
 # Initialize data before creating UI
+if DEBUG_MODE:
+    print("\n" + "="*80)
+    print("🐛 DEBUG MODE ENABLED 🐛")
+    print("="*80)
+    print("PR retrieval is limited to 10 PRs per query pattern per agent")
+
+    # Show how debug mode was enabled
+    if args.debug:
+        print("Enabled via: command-line flag '--debug'")
+        print("To disable: run without '--debug' flag")
+    else:
+        print("Enabled via: DEBUG_MODE environment variable")
+        print("To disable: run with '--no-debug' flag or unset DEBUG_MODE")
+
+    print("="*80 + "\n")
+else:
+    print("\n🚀 Starting in PRODUCTION MODE - full PR retrieval enabled")
+    if args.no_debug:
+        print("   (Explicitly set via '--no-debug' flag)")
+    print()
+
 initialize_data()
 
 # Start background update thread
@@ -756,7 +1173,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Organization"],
-                filter_columns=["Acceptance Rate (%)", "Median Merge Duration (minutes)"]
+                filter_columns=["Acceptance Rate (%)"]
             )
             
             refresh_button.click(
