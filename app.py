@@ -210,7 +210,7 @@ def fetch_all_prs(identifier, token=None):
     Searches using multiple query patterns:
     - is:pr author:{identifier} (authored by the user)
     - is:pr head:{identifier}/ (branch names starting with identifier)
-    - is:pr "Co-Authored-By: {identifier}" (co-authored commits)
+    - is:pr "co-authored-by: {identifier}" (co-authored commits)
 
     Uses pagination to retrieve all results and deduplicates by PR ID.
     """
@@ -220,7 +220,7 @@ def fetch_all_prs(identifier, token=None):
     query_patterns = [
         f'is:pr author:{identifier}',
         f'is:pr head:{identifier}/',
-        f'is:pr "Co-Authored-By: {identifier}"'
+        f'is:pr "co-authored-by: {identifier}"'
     ]
 
     # Use a dict to deduplicate PRs by ID
