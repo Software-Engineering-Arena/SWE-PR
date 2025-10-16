@@ -31,11 +31,8 @@ LEADERBOARD_COLUMNS = [
     ("Organization", "string"),
     ("GitHub Name", "string"),
     ("Total PRs", "number"),
-    ("Merged", "number"),
-    ("Open", "number"),
-    ("Closed (Not Merged)", "number"),
+    ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
-    ("Repositories", "number"),
     ("First Contribution", "string"),
     ("Last Updated", "string")
 ]
@@ -268,8 +265,6 @@ def calculate_pr_stats(prs):
     """
     total_prs = len(prs)
     merged = 0
-    open_count = 0
-    closed_not_merged = 0
     repos = set()
     prs_by_repo = defaultdict(int)
     first_contribution = None
@@ -293,24 +288,17 @@ def calculate_pr_stats(prs):
         
         # Track PR status
         state = pr.get('state')
-        if state == 'open':
-            open_count += 1
-        elif state == 'closed':
+        if state == 'closed':
             pull_request = pr.get('pull_request', {})
             if pull_request.get('merged_at'):
                 merged += 1
-            else:
-                closed_not_merged += 1
     
     acceptance_rate = (merged / total_prs * 100) if total_prs > 0 else 0
     
     return {
         'total_prs': total_prs,
         'merged': merged,
-        'open': open_count,
-        'closed_not_merged': closed_not_merged,
         'acceptance_rate': round(acceptance_rate, 2),
-        'repo_count': len(repos),
         'first_contribution': first_contribution or 'N/A',
         'last_contribution': last_contribution or 'N/A',
         'prs_by_repo': dict(prs_by_repo)
@@ -570,10 +558,7 @@ def get_leaderboard_dataframe():
             github_name,
             data.get('total_prs', 0),
             data.get('merged', 0),
-            data.get('open', 0),
-            data.get('closed_not_merged', 0),
             data.get('acceptance_rate', 0.0),
-            data.get('repo_count', 0),
             normalize_date_format(data.get('first_contribution', 'N/A')),
             normalize_date_format(data.get('last_updated', 'N/A'))
         ])
@@ -583,15 +568,14 @@ def get_leaderboard_dataframe():
     df = pd.DataFrame(rows, columns=column_names)
     
     # Ensure numeric types
-    numeric_cols = ["Total PRs", "Merged", "Open", "Closed (Not Merged)", 
-                    "Acceptance Rate (%)", "Repositories"]
+    numeric_cols = ["Total PRs", "Merged PRs", "Acceptance Rate (%)"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
-    # Sort by merged PRs descending
-    if "Merged" in df.columns and not df.empty:
-        df = df.sort_values(by="Merged", ascending=False).reset_index(drop=True)
+    # Sort by Acceptance Rate (%) descending
+    if "Acceptance Rate (%)" in df.columns and not df.empty:
+        df = df.sort_values(by="Acceptance Rate (%)", ascending=False).reset_index(drop=True)
     
     return df
 
