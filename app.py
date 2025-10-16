@@ -29,7 +29,6 @@ UPDATE_INTERVAL = 86400  # 24 hours in seconds
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
     ("Organization", "string"),
-    ("GitHub Name", "string"),
     ("Total PRs", "number"),
     ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
@@ -70,8 +69,8 @@ def save_jsonl(filename, data):
 
 
 def cache_to_dict(cache_list):
-    """Convert list of cache entries to dictionary keyed by github_name."""
-    return {entry['github_name']: entry for entry in cache_list}
+    """Convert list of cache entries to dictionary by identifier."""
+    return {entry['identifier']: entry for entry in cache_list}
 
 
 def dict_to_cache(cache_dict):
@@ -189,12 +188,12 @@ def get_github_token():
     return token
 
 
-def validate_github_username(github_name):
+def validate_github_username(identifier):
     """Verify that a GitHub username exists with backoff-aware requests."""
     try:
         token = get_github_token()
         headers = {'Authorization': f'token {token}'} if token else {}
-        url = f'https://api.github.com/users/{github_name}'
+        url = f'https://api.github.com/users/{identifier}'
         response = request_with_backoff('GET', url, headers=headers, max_retries=6)
         if response is None:
             return False, "Validation error: network/rate limit exhausted"
@@ -208,7 +207,7 @@ def validate_github_username(github_name):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_all_prs(github_name, token=None):
+def fetch_all_prs(identifier, token=None):
     """
     Fetch all pull requests authored by a GitHub user.
     Uses pagination to retrieve all results.
@@ -221,7 +220,7 @@ def fetch_all_prs(github_name, token=None):
     while True:
         url = f'https://api.github.com/search/issues'
         params = {
-            'q': f'is:pr author:{github_name}',
+            'q': f'is:pr author:{identifier}',
             'per_page': per_page,
             'page': page
         }
@@ -229,11 +228,11 @@ def fetch_all_prs(github_name, token=None):
         try:
             response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=6)
             if response is None:
-                print(f"Error fetching PRs for {github_name}: retries exhausted")
+                print(f"Error fetching PRs for {identifier}: retries exhausted")
                 break
 
             if response.status_code != 200:
-                print(f"Error fetching PRs for {github_name}: HTTP {response.status_code}")
+                print(f"Error fetching PRs for {identifier}: HTTP {response.status_code}")
                 break
 
             data = response.json()
@@ -252,7 +251,7 @@ def fetch_all_prs(github_name, token=None):
             time.sleep(0.5)  # Courtesy delay between pages
 
         except Exception as e:
-            print(f"Error fetching PRs for {github_name}: {str(e)}")
+            print(f"Error fetching PRs for {identifier}: {str(e)}")
             break
     
     return all_prs
@@ -305,15 +304,15 @@ def calculate_pr_stats(prs):
     }
 
 
-def fetch_agent_stats(github_name, token=None):
+def fetch_agent_stats(identifier, token=None):
     """
     Fetch and calculate PR statistics for a single agent.
     Returns dictionary with all stats and metadata.
     """
-    print(f"Fetching data for {github_name}...")
-    prs = fetch_all_prs(github_name, token)
+    print(f"Fetching data for {identifier}...")
+    prs = fetch_all_prs(identifier, token)
     stats = calculate_pr_stats(prs)
-    stats['github_name'] = github_name
+    stats['identifier'] = identifier
     stats['last_updated'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     return stats
 
@@ -330,7 +329,7 @@ def load_submissions_dataset():
         for row in dataset:
             submissions.append({
                 'agent_name': row.get('agent_name', 'Unknown'),
-                'github_name': row.get('github_name'),
+                'identifier': row.get('identifier'),
                 'organization': row.get('organization', 'Unknown'),
                 'description': row.get('description', ''),
             })
@@ -377,12 +376,12 @@ def save_submission_to_hf(data):
         # Create timestamped filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         year = datetime.now().year
-        github_name = data['github_name']
-        filename = f"{year}/{timestamp}_{github_name}.json"
+        identifier = data['identifier']
+        filename = f"{year}/{timestamp}_{identifier}.json"
         
         # Save locally first
         os.makedirs(str(year), exist_ok=True)
-        filepath = f"{year}/{timestamp}_{github_name}.json"
+        filepath = f"{year}/{timestamp}_{identifier}.json"
         
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
@@ -468,19 +467,19 @@ def update_all_agents():
     
     # Update each agent
     for agent in agents:
-        github_name = agent.get('github_name')
-        if not github_name:
-            print(f"Warning: Skipping agent without github_name: {agent}")
+        identifier = agent.get('identifier')
+        if not identifier:
+            print(f"Warning: Skipping agent without identifier: {agent}")
             continue
         
         try:
             # Fetch fresh PR statistics
-            stats = fetch_agent_stats(github_name, token)
+            stats = fetch_agent_stats(identifier, token)
             
             # Merge metadata with stats
-            cache_dict[github_name] = {
+            cache_dict[identifier] = {
                 'agent_name': agent.get('agent_name', 'Unknown'),
-                'github_name': github_name,
+                'identifier': identifier,
                 'organization': agent.get('organization', 'Unknown'),
                 'description': agent.get('description', ''),
                 **stats
@@ -488,10 +487,10 @@ def update_all_agents():
             
             # Progressive save
             save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
-            print(f"✓ Updated {github_name}")
+            print(f"✓ Updated {identifier}")
             
         except Exception as e:
-            print(f"✗ Error updating {github_name}: {str(e)}")
+            print(f"✗ Error updating {identifier}: {str(e)}")
             continue
     
     return cache_dict
@@ -549,13 +548,13 @@ def get_leaderboard_dataframe():
     cache_dict = cache_to_dict(cache_list)
     
     rows = []
-    for github_name, data in cache_dict.items():
+    for identifier, data in cache_dict.items():
         # Only include display-relevant fields
         # Normalize date formats for consistent display
         rows.append([
             data.get('agent_name', 'Unknown'),
             data.get('organization', 'Unknown'),
-            github_name,
+            identifier,
             data.get('total_prs', 0),
             data.get('merged', 0),
             data.get('acceptance_rate', 0.0),
@@ -594,13 +593,13 @@ def refresh_leaderboard():
         return error_msg, get_leaderboard_dataframe()
 
 
-def submit_agent(github_name, agent_name, organization, description):
+def submit_agent(identifier, agent_name, organization, description):
     """
     Submit a new agent to the leaderboard.
     Validates input, saves submission, and fetches PR data.
     """
     # Validate required fields
-    if not github_name or not github_name.strip():
+    if not identifier or not identifier.strip():
         return "❌ GitHub username is required", get_leaderboard_dataframe()
     if not agent_name or not agent_name.strip():
         return "❌ Agent name is required", get_leaderboard_dataframe()
@@ -608,27 +607,27 @@ def submit_agent(github_name, agent_name, organization, description):
         return "❌ Organization name is required", get_leaderboard_dataframe()
     
     # Clean inputs
-    github_name = github_name.strip()
+    identifier = identifier.strip()
     agent_name = agent_name.strip()
     organization = organization.strip()
     description = description.strip() if description else ""
     
     # Validate GitHub username
-    is_valid, message = validate_github_username(github_name)
+    is_valid, message = validate_github_username(identifier)
     if not is_valid:
         return f"❌ {message}", get_leaderboard_dataframe()
     
     # Check for duplicates
     agents = load_jsonl(AGENTS_FILE)
-    existing_names = {agent['github_name'] for agent in agents}
+    existing_names = {agent['identifier'] for agent in agents}
     
-    if github_name in existing_names:
-        return f"⚠️ Agent with GitHub name '{github_name}' already exists", get_leaderboard_dataframe()
+    if identifier in existing_names:
+        return f"⚠️ Agent with identifier '{identifier}' already exists", get_leaderboard_dataframe()
     
     # Create submission
     submission = {
         'agent_name': agent_name,
-        'github_name': github_name,
+        'identifier': identifier,
         'organization': organization,
         'description': description,
     }
@@ -644,12 +643,12 @@ def submit_agent(github_name, agent_name, organization, description):
     # Fetch PR data immediately
     token = get_github_token()
     try:
-        stats = fetch_agent_stats(github_name, token)
+        stats = fetch_agent_stats(identifier, token)
         
         # Update cache
         cache_list = load_jsonl(CACHE_FILE)
         cache_dict = cache_to_dict(cache_list)
-        cache_dict[github_name] = {**submission, **stats}
+        cache_dict[identifier] = {**submission, **stats}
         save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
         
         # Save to HuggingFace
@@ -714,7 +713,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
             leaderboard_table = Leaderboard(
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
-                search_columns=["Agent Name", "Organization", "GitHub Name"],
+                search_columns=["Agent Name", "Organization"],
                 filter_columns=["Total PRs", "Acceptance Rate (%)"]
             )
             
