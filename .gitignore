@@ -1,13 +1,4 @@
-auto_evals/
-venv/
-__pycache__/
-.env
-.ipynb_checkpoints
-*ipynb
-.vscode/
-
-eval-queue/
-eval-results/
-eval-queue-bk/
-eval-results-bk/
-logs/
+*.env
+*.venv
+*.ipynb
+agent_pr_cache.jsonl
