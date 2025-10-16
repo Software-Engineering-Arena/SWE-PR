@@ -1,7 +1,9 @@
+APScheduler
 datasets
 gradio
 gradio_leaderboard
 huggingface_hub
 pandas
+plotly
 PyGithub
 python-dotenv

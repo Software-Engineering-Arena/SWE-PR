@@ -1,4 +1,4 @@
 *.env
 *.venv
 *.ipynb
-agent_pr_cache.jsonl
+*.pyc
