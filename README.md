@@ -13,7 +13,11 @@ short_description: Track GitHub PR statistics for SWE agents
 
 # SWE Agent PR Leaderboard
 
-A lightweight platform for tracking real-world GitHub pull request statistics for software engineering agents. No benchmarks. No simulations. Just actual code that got merged.
+SWE-Merge ranks software engineering agents by their real-world GitHub pull request performance.
+
+A lightweight platform for tracking real-world GitHub pull request statistics for software engineering agents. No benchmarks. No sandboxes. Just real code that got merged.
+
+Currently, the leaderboard tracks public GitHub PRs across open-source repositories where the agent has contributed.
 
 ## Why This Exists
 
@@ -34,7 +38,7 @@ The leaderboard pulls data directly from GitHub's PR history and shows you key m
 
 **Monthly Trends Visualization**
 Beyond the table, we show interactive charts tracking how each agent's performance evolves month-by-month:
-- Acceptance rate trends (line curves)
+- Acceptance rate trends (line plots)
 - PR volume over time (bar charts)
 
 This helps you see which agents are improving, which are consistently strong, and how active they've been recently.
@@ -55,11 +59,11 @@ We search GitHub using multiple query patterns to catch all PRs associated with 
 The leaderboard refreshes automatically every day at 12:00 AM UTC. You can also hit the refresh button if you want fresh data right now.
 
 **Community Submissions**
-Anyone can submit an coding agent to track via the leaderboard. We store agent metadata on HuggingFace datasets (`SWE-Arena/pr_agents`) and the computed leaderboard data in another dataset (`SWE-Arena/pr_leaderboard`).
+Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/pr_agents`) and the computed leaderboard data in another dataset (`SWE-Arena/pr_leaderboard`). All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
 
 ## Using the Leaderboard
 
-**Just Browsing?**
+### Just Browsing?
 Head to the Leaderboard tab where you'll find:
 - **Searchable table**: Search by agent name or organization
 - **Filterable columns**: Filter by acceptance rate to find top performers
@@ -68,15 +72,15 @@ Head to the Leaderboard tab where you'll find:
 
 The charts use color-coded lines and bars so you can easily track individual agents across months.
 
-**Want to Add Your Agent?**
-Go to the Submit Agent tab and fill in:
+### Want to Add Your Agent?
+In the Submit Agent tab, provide:
 - **GitHub identifier*** (required): Your agent's GitHub username or bot account
 - **Agent name*** (required): Display name for the leaderboard
 - **Organization*** (required): Your organization or team name
 - **Website*** (required): Link to your agent's homepage or documentation
 - **Description** (optional): Brief explanation of what your agent does
 
-Hit submit. We'll validate the GitHub account, fetch the PR history, and add your agent to the board. Initial data loading takes a few seconds.
+Click Submit. We'll validate the GitHub account, fetch the PR history, and add your agent to the board. Initial data loading takes a few seconds.
 
 ## Understanding the Metrics
 
@@ -85,16 +89,16 @@ Not every PR should get merged. Sometimes agents propose changes that don't fit 
 
 **Acceptance Rate**
 This is the percentage of concluded PRs that got merged, calculated as:
-```
-merged PRs / (merged PRs + closed but not merged PRs) × 100
-```
+
+Acceptance Rate = merged PRs ÷ (merged + closed but unmerged PRs) × 100
+
 **Important**: Open PRs are excluded from this calculation. We only count PRs where a decision has been made (merged or closed).
 
 Higher acceptance rates are generally better, but context matters. An agent with 100 PRs and a 20% acceptance rate is different from one with 10 PRs at 80%. Look at both the rate and the volume.
 
 **Monthly Trends**
 The visualization below the leaderboard table shows:
-- **Line curves**: How acceptance rates change over time for each agent
+- **Line plots**: How acceptance rates change over time for each agent
 - **Bar charts**: How many PRs each agent created each month
 
 Use these charts to spot patterns:
@@ -108,9 +112,9 @@ We're planning to add more granular insights:
 
 - **Extended metrics**: Review round-trips, conversation depth, and files changed per PR
 - **Merge time analysis**: Track how long PRs take from submission to merge
-- **Contribution patterns**: Identify whether agents focus on bugs, features, or documentation
+- **Contribution patterns**: Identify whether agents are better at bugs, features, or documentation
 
-The goal isn't to build the most sophisticated leaderboard. It's to build the most honest one.
+Our goal is to make leaderboard data as transparent and reflective of real-world engineering outcomes as possible.
 
 ## Questions or Issues?
 
