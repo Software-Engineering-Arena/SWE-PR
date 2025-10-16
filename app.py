@@ -6,7 +6,7 @@ import time
 import requests
 from datetime import datetime, timezone
 from collections import defaultdict
-from huggingface_hub import HfApi, HfFolder, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download
 from datasets import load_dataset, Dataset
 import threading
 from dotenv import load_dotenv
@@ -104,8 +104,7 @@ def normalize_date_format(date_string):
 # GITHUB API OPERATIONS
 # =============================================================================
 
-def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None,
-                         max_retries=10, timeout=60):
+def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None, max_retries=10, timeout=30):
     """
     Perform an HTTP request with exponential backoff and jitter for GitHub API.
     Retries on 403/429 (rate limits), 5xx server errors, and transient network exceptions.
@@ -241,7 +240,7 @@ def fetch_all_prs(identifier, token=None):
             }
 
             try:
-                response = request_with_backoff('GET', url, headers=headers, params=params, max_retries=6)
+                response = request_with_backoff('GET', url, headers=headers, params=params)
                 if response is None:
                     print(f"Error fetching PRs for query '{query}': retries exhausted")
                     break
@@ -419,14 +418,22 @@ def load_leaderboard_dataset():
         return None
 
 
+def get_hf_token():
+    """Get HuggingFace token from environment variables."""
+    token = os.getenv('HF_TOKEN')
+    if not token:
+        print("Warning: HF_TOKEN not found in environment variables")
+    return token
+
+
 def save_agent_to_hf(data):
     """Save a new agent to HuggingFace dataset as {identifier}.json in root."""
     try:
         api = HfApi()
-        token = HfFolder.get_token()
+        token = get_hf_token()
 
         if not token:
-            raise Exception("No HuggingFace token found")
+            raise Exception("No HuggingFace token found. Please set HF_TOKEN in your Space settings.")
 
         identifier = data['github_identifier']
         filename = f"{identifier}.json"
@@ -458,9 +465,9 @@ def save_agent_to_hf(data):
 def save_leaderboard_to_hf(cache_dict):
     """Save complete leaderboard to HuggingFace dataset as CSV."""
     try:
-        token = HfFolder.get_token()
+        token = get_hf_token()
         if not token:
-            raise Exception("No HuggingFace token found")
+            raise Exception("No HuggingFace token found. Please set HF_TOKEN in your Space settings.")
         
         # Convert to DataFrame
         data_list = dict_to_cache(cache_dict)
