@@ -32,6 +32,7 @@ LEADERBOARD_COLUMNS = [
     ("Total PRs", "number"),
     ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
+    ("Median Merge Duration (minutes)", "number"),
 ]
 
 # =============================================================================
@@ -219,8 +220,8 @@ def fetch_all_prs(identifier, token=None):
 
     # Define all query patterns to search
     query_patterns = [
-        # f'is:pr author:{identifier}',
-        f'is:pr head:{identifier}/',
+        f'is:pr author:{identifier}',
+        # f'is:pr head:{identifier}/',
         # f'is:pr "Co-Authored-By: {identifier}"'
     ]
 
@@ -291,6 +292,7 @@ def calculate_pr_stats(prs):
     total_prs = len(prs)
     merged = 0
     repos = set()
+    merged_times = []  # Store merged times in minutes for merged PRs
     
     for pr in prs:
         # Track repository information
@@ -303,15 +305,39 @@ def calculate_pr_stats(prs):
         state = pr.get('state')
         if state == 'closed':
             pull_request = pr.get('pull_request', {})
-            if pull_request.get('merged_at'):
+            merged_at = pull_request.get('merged_at')
+            if merged_at:
                 merged += 1
+                
+                # Calculate merged time (creation to merge)
+                try:
+                    created_at = pr.get('created_at')
+                    if created_at and merged_at:
+                        created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        merged_dt = datetime.fromisoformat(merged_at.replace('Z', '+00:00'))
+                        merged_time_minutes = (merged_dt - created_dt).total_seconds() / 60  # Convert to minutes
+                        merged_times.append(merged_time_minutes)
+                except Exception as e:
+                    print(f"Warning: Could not calculate merged time for PR: {e}")
     
     acceptance_rate = (merged / total_prs * 100) if total_prs > 0 else 0
+    
+    # Calculate median merged time
+    median_merged_time = None
+    if merged_times:
+        merged_times.sort()
+        n = len(merged_times)
+        if n % 2 == 0:
+            median_merged_time = (merged_times[n // 2 - 1] + merged_times[n // 2]) / 2
+        else:
+            median_merged_time = merged_times[n // 2]
+        median_merged_time = round(median_merged_time, 2)
     
     return {
         'total_prs': total_prs,
         'merged': merged,
         'acceptance_rate': round(acceptance_rate, 2),
+        'median_merged_time': median_merged_time,
     }
 
 
@@ -565,6 +591,7 @@ def get_leaderboard_dataframe():
             data.get('total_prs', 0),
             data.get('merged', 0),
             data.get('acceptance_rate', 0.0),
+            data.get('median_merged_time', None),
         ])
     
     # Create DataFrame
@@ -572,7 +599,7 @@ def get_leaderboard_dataframe():
     df = pd.DataFrame(rows, columns=column_names)
     
     # Ensure numeric types
-    numeric_cols = ["Total PRs", "Merged PRs", "Acceptance Rate (%)"]
+    numeric_cols = ["Total PRs", "Merged PRs", "Acceptance Rate (%)", "Median Merge Duration (minutes)"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -723,7 +750,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Organization"],
-                filter_columns=["Acceptance Rate (%)", "Merged PRs"]
+                filter_columns=["Acceptance Rate (%)", "Median Merge Duration (minutes)"]
             )
             
             refresh_button.click(
