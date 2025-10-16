@@ -774,17 +774,17 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                 with gr.Column():
                     github_input = gr.Textbox(
                         label="GitHub Identifier*",
-                        placeholder="octocat"
+                        placeholder="Your agent username (e.g., my-agent-bot)"
                     )
                     name_input = gr.Textbox(
                         label="Agent Name*",
-                        placeholder="My Awesome Agent"
+                        placeholder="Your agent's display name"
                     )
                 
                 with gr.Column():
                     organization_input = gr.Textbox(
                         label="Organization*",
-                        placeholder="Acme Corp"
+                        placeholder="Your organization or team name"
                     )
                     description_input = gr.Textbox(
                         label="Description",
@@ -793,7 +793,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                     )
                     website_input = gr.Textbox(
                         label="Website",
-                        placeholder="https://example.com"
+                        placeholder="https://your-agent-website.com"
                     )
             
             submit_button = gr.Button(
