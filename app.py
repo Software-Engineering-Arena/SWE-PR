@@ -347,7 +347,7 @@ def extract_pr_metadata(pr):
     }
 
 
-def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, year=None):
+def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, year=None, exclude_dates=None):
     """
     Fetch pull requests associated with a GitHub user/bot for the past 6 months.
     Returns lightweight metadata instead of full PR objects.
@@ -364,6 +364,7 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
         token: GitHub API token
         start_from_date: Only fetch PRs created after this date (for incremental updates)
         year: Year parameter (deprecated, kept for compatibility but not used)
+        exclude_dates: Set of date objects to exclude from mining (already-mined dates)
 
     Returns:
         List of minimal PR metadata dictionaries
@@ -427,6 +428,30 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
 
     # Convert to lightweight metadata
     all_prs = list(prs_by_id.values())
+
+    # Filter out PRs from excluded dates if specified
+    if exclude_dates:
+        filtered_prs = []
+        excluded_count = 0
+        for pr in all_prs:
+            created_at = pr.get('created_at')
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    pr_date = dt.date()
+                    if pr_date not in exclude_dates:
+                        filtered_prs.append(pr)
+                    else:
+                        excluded_count += 1
+                except Exception:
+                    filtered_prs.append(pr)  # Keep PRs with unparseable dates
+            else:
+                filtered_prs.append(pr)  # Keep PRs without created_at
+
+        if excluded_count > 0:
+            print(f"   ⏭️ Skipped {excluded_count} PRs from already-mined dates")
+        all_prs = filtered_prs
+
     if DEBUG_MODE:
         print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_prs)} unique PRs for {identifier}")
         print(f"   Note: In production mode, this would fetch ALL PRs")
@@ -675,19 +700,21 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
             # Save locally
             save_jsonl(local_filename, merged_metadata)
 
-            # Upload to HuggingFace with folder path
-            api.upload_file(
-                path_or_fileobj=local_filename,
-                path_in_repo=filename,
-                repo_id=PR_METADATA_REPO,
-                repo_type="dataset",
-                token=token
-            )
-
-            # Clean up local file
-            os.remove(local_filename)
-
-            print(f"   ✓ Saved {len(merged_metadata)} total PRs to {filename}")
+            try:
+                # Upload to HuggingFace with folder path
+                upload_with_retry(
+                    api=api,
+                    path_or_fileobj=local_filename,
+                    path_in_repo=filename,
+                    repo_id=PR_METADATA_REPO,
+                    repo_type="dataset",
+                    token=token
+                )
+                print(f"   ✓ Saved {len(merged_metadata)} total PRs to {filename}")
+            finally:
+                # Always clean up local file, even if upload fails
+                if os.path.exists(local_filename):
+                    os.remove(local_filename)
 
         return True
 
@@ -891,6 +918,61 @@ def get_daily_files_last_n_months(agent_identifier, n_months=6):
         return []
 
 
+def get_already_mined_dates(agent_identifier, n_months=6):
+    """
+    Get set of dates that have already been mined for an agent.
+
+    Args:
+        agent_identifier: GitHub identifier of the agent
+        n_months: Number of months to look back (default: 6)
+
+    Returns:
+        Set of date objects (datetime.date) that already have data files
+    """
+    try:
+        api = HfApi()
+
+        # Calculate date range
+        today = datetime.now(timezone.utc)
+        n_months_ago = today - timedelta(days=30 * n_months)
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
+
+        # Filter for files in this agent's folder
+        agent_pattern = f"{agent_identifier}/"
+        agent_files = [f for f in files if f.startswith(agent_pattern) and f.endswith('.jsonl')]
+
+        mined_dates = set()
+        for filename in agent_files:
+            try:
+                # Extract date from filename: [agent_identifier]/YYYY.MM.DD.jsonl
+                parts = filename.split('/')
+                if len(parts) != 2:
+                    continue
+
+                date_part = parts[1].replace('.jsonl', '')  # Get YYYY.MM.DD
+                date_components = date_part.split('.')
+                if len(date_components) != 3:
+                    continue
+
+                file_year, file_month, file_day = map(int, date_components)
+                file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc).date()
+
+                # Only include dates within the last n_months
+                if n_months_ago.date() <= file_date <= today.date():
+                    mined_dates.add(file_date)
+            except Exception as e:
+                print(f"   Warning: Could not parse date from filename {filename}: {e}")
+                continue
+
+        return mined_dates
+
+    except Exception as e:
+        print(f"   Warning: Could not get already-mined dates for {agent_identifier}: {str(e)}")
+        return set()
+
+
 def fetch_pr_current_status(pr_url, token):
     """
     Fetch the current status of a single PR from GitHub API.
@@ -1024,19 +1106,22 @@ def refresh_open_prs_for_agent(agent_identifier, token):
                     # Save locally
                     save_jsonl(local_filename, updated_prs)
 
-                    # Upload back to HuggingFace
-                    api = HfApi()
-                    api.upload_file(
-                        path_or_fileobj=local_filename,
-                        path_in_repo=filename,
-                        repo_id=PR_METADATA_REPO,
-                        repo_type="dataset",
-                        token=get_hf_token()
-                    )
-
-                    # Clean up local file
-                    os.remove(local_filename)
-                    print(f"   💾 Updated {filename}")
+                    try:
+                        # Upload back to HuggingFace
+                        api = HfApi()
+                        upload_with_retry(
+                            api=api,
+                            path_or_fileobj=local_filename,
+                            path_in_repo=filename,
+                            repo_id=PR_METADATA_REPO,
+                            repo_type="dataset",
+                            token=get_hf_token()
+                        )
+                        print(f"   💾 Updated {filename}")
+                    finally:
+                        # Always clean up local file, even if upload fails
+                        if os.path.exists(local_filename):
+                            os.remove(local_filename)
 
             except Exception as e:
                 print(f"   Warning: Could not process {filename}: {str(e)}")
@@ -1131,6 +1216,49 @@ def get_hf_token():
     return token
 
 
+def upload_with_retry(api, path_or_fileobj, path_in_repo, repo_id, repo_type, token, max_retries=5):
+    """
+    Upload file to HuggingFace with exponential backoff retry logic.
+
+    Args:
+        api: HfApi instance
+        path_or_fileobj: Local file path to upload
+        path_in_repo: Target path in the repository
+        repo_id: Repository ID
+        repo_type: Type of repository (e.g., "dataset")
+        token: HuggingFace token
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        True if upload succeeded, raises exception if all retries failed
+    """
+    delay = 2.0  # Initial delay in seconds
+
+    for attempt in range(max_retries):
+        try:
+            api.upload_file(
+                path_or_fileobj=path_or_fileobj,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                token=token
+            )
+            if attempt > 0:
+                print(f"   ✓ Upload succeeded on attempt {attempt + 1}/{max_retries}")
+            return True
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = delay + random.uniform(0, 1.0)
+                print(f"   ⚠️ Upload failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                print(f"   ⏳ Retrying in {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+                delay = min(delay * 2, 60.0)  # Exponential backoff, max 60s
+            else:
+                print(f"   ✗ Upload failed after {max_retries} attempts: {str(e)}")
+                raise
+
+
 def save_agent_to_hf(data):
     """Save a new agent to HuggingFace dataset as {identifier}.json in root."""
     try:
@@ -1147,20 +1275,22 @@ def save_agent_to_hf(data):
         with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
 
-        # Upload to HuggingFace (root directory)
-        api.upload_file(
-            path_or_fileobj=filename,
-            path_in_repo=filename,
-            repo_id=AGENTS_REPO,
-            repo_type="dataset",
-            token=token
-        )
-
-        # Clean up local file
-        os.remove(filename)
-
-        print(f"✓ Saved agent to HuggingFace: {filename}")
-        return True
+        try:
+            # Upload to HuggingFace (root directory)
+            upload_with_retry(
+                api=api,
+                path_or_fileobj=filename,
+                path_in_repo=filename,
+                repo_id=AGENTS_REPO,
+                repo_type="dataset",
+                token=token
+            )
+            print(f"✓ Saved agent to HuggingFace: {filename}")
+            return True
+        finally:
+            # Always clean up local file, even if upload fails
+            if os.path.exists(filename):
+                os.remove(filename)
 
     except Exception as e:
         print(f"✗ Error saving agent: {str(e)}")
@@ -1192,21 +1322,23 @@ def save_leaderboard_to_hf(cache_dict):
         filename = f"{year}.csv"
         df.to_csv(filename, index=False)
 
-        # Upload to HuggingFace
-        api = HfApi()
-        api.upload_file(
-            path_or_fileobj=filename,
-            path_in_repo=filename,
-            repo_id=LEADERBOARD_REPO,
-            repo_type="dataset",
-            token=token
-        )
-
-        # Clean up local file
-        os.remove(filename)
-
-        print(f"✓ Saved leaderboard to HuggingFace as {filename} ({len(data_list)} entries)")
-        return True
+        try:
+            # Upload to HuggingFace
+            api = HfApi()
+            upload_with_retry(
+                api=api,
+                path_or_fileobj=filename,
+                path_in_repo=filename,
+                repo_id=LEADERBOARD_REPO,
+                repo_type="dataset",
+                token=token
+            )
+            print(f"✓ Saved leaderboard to HuggingFace as {filename} ({len(data_list)} entries)")
+            return True
+        finally:
+            # Always clean up local file, even if upload fails
+            if os.path.exists(filename):
+                os.remove(filename)
 
     except Exception as e:
         print(f"✗ Error saving leaderboard: {str(e)}")
@@ -1222,10 +1354,12 @@ def update_all_agents_incremental():
     Memory-efficient incremental update of PR statistics for all agents.
 
     Strategy:
-    1. For each agent, check latest PR date from stored metadata
-    2. Only fetch NEW PRs created after that date
-    3. Store minimal metadata (not full PR objects) to avoid storage limits
-    4. Construct leaderboard from stored metadata
+    1. For each agent, load existing data from SWE-Arena/pr_metadata
+    2. Identify already-mined dates (based on filename: YYYY.MM.DD.jsonl)
+    3. Only fetch PRs from dates that haven't been mined yet (within last 6 months)
+    4. If no data exists at all, mine everything from scratch
+    5. Store minimal metadata (not full PR objects) to avoid storage limits
+    6. Construct leaderboard from ALL stored metadata (last 6 months)
 
     Returns dictionary of all agent data with current stats.
     """
@@ -1254,32 +1388,39 @@ def update_all_agents_incremental():
             print(f"Processing: {agent_name} ({identifier})")
             print(f"{'='*80}")
 
-            # Check for existing metadata to determine incremental update date
-            latest_pr_date = get_latest_pr_date_for_agent(identifier)
+            # Get already-mined dates for this agent (last 6 months)
+            already_mined_dates = get_already_mined_dates(identifier, n_months=6)
 
-            if latest_pr_date:
-                print(f"📅 Latest PR found: {latest_pr_date.strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"   Fetching only PRs created after this date...")
-                start_from = latest_pr_date + timedelta(seconds=1)  # Start 1 second after
+            if already_mined_dates:
+                print(f"📅 Found {len(already_mined_dates)} already-mined dates")
+                print(f"   Skipping these dates and fetching only new data...")
+                # Fetch only PRs from dates not yet mined
+                new_metadata = fetch_all_prs_metadata(
+                    identifier,
+                    agent_name,
+                    token,
+                    start_from_date=None,  # Use full 6-month range
+                    exclude_dates=already_mined_dates  # But exclude already-mined dates
+                )
             else:
-                print(f"📅 No existing PRs found. Fetching all PR metadata...")
-                start_from = None
-
-            # Fetch PR metadata (lightweight, memory-efficient)
-            new_metadata = fetch_all_prs_metadata(
-                identifier,
-                agent_name,
-                token,
-                start_from_date=start_from
-            )
+                print(f"📅 No existing data found. Mining everything from scratch...")
+                # Mine everything from scratch (full 6-month range)
+                new_metadata = fetch_all_prs_metadata(
+                    identifier,
+                    agent_name,
+                    token,
+                    start_from_date=None
+                )
 
             if new_metadata:
-                # Save new metadata to HuggingFace (organized by agent_identifier/year.month)
+                # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
                 print(f"💾 Saving {len(new_metadata)} new PR records...")
                 save_pr_metadata_to_hf(new_metadata, identifier)
+            else:
+                print(f"   No new PRs to save")
 
-            # Load all metadata for current year to calculate stats
-            print(f"📊 Calculating statistics from stored metadata...")
+            # Load ALL metadata for current year to calculate stats (aggregates entire last 6 months)
+            print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
             all_year_metadata = load_pr_metadata_for_year(current_year)
 
             # Filter for this specific agent
