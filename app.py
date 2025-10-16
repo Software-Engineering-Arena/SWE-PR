@@ -349,7 +349,7 @@ def extract_pr_metadata(pr):
 
 def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, year=None):
     """
-    Fetch pull requests associated with a GitHub user/bot for a specific year.
+    Fetch pull requests associated with a GitHub user/bot for the past 6 months.
     Returns lightweight metadata instead of full PR objects.
 
     Uses time-based partitioning to bypass GitHub's 1000-result limit per query.
@@ -363,7 +363,7 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
         agent_name: Human-readable agent name for metadata
         token: GitHub API token
         start_from_date: Only fetch PRs created after this date (for incremental updates)
-        year: Year to fetch PRs for (defaults to current year)
+        year: Year parameter (deprecated, kept for compatibility but not used)
 
     Returns:
         List of minimal PR metadata dictionaries
@@ -386,20 +386,18 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     # Use a dict to deduplicate PRs by ID
     prs_by_id = {}
 
-    # Default to current year if not specified
-    if year is None:
-        year = datetime.now().year
-
-    # Define time range: current year only (or from start_from_date if specified)
-    if start_from_date:
-        start_date = start_from_date
-    else:
-        start_date = datetime(year, 1, 1, tzinfo=timezone.utc)
-
-    # End date is either end of year or current time (whichever is earlier)
-    end_of_year = datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    # Define time range: past 6 months only (or from start_from_date if specified)
     current_time = datetime.now(timezone.utc)
-    end_date = min(end_of_year, current_time)
+    six_months_ago = current_time - timedelta(days=180)  # ~6 months
+
+    if start_from_date:
+        # Use start_from_date but ensure it's not older than 6 months
+        start_date = max(start_from_date, six_months_ago)
+    else:
+        start_date = six_months_ago
+
+    # End date is current time
+    end_date = current_time
 
     for query_pattern in query_patterns:
         print(f"\n🔍 Searching with query: {query_pattern}")
@@ -481,10 +479,10 @@ def calculate_pr_stats_from_metadata(metadata_list):
     }
 
 
-def calculate_monthly_metrics_by_agent(current_year):
+def calculate_monthly_metrics_by_agent():
     """
     Calculate monthly metrics for all agents for visualization.
-    Loads data directly from SWE-Arena/pr_metadata dataset.
+    Loads data directly from SWE-Arena/pr_metadata dataset for the current year.
 
     Returns:
         dict: {
@@ -500,6 +498,9 @@ def calculate_monthly_metrics_by_agent(current_year):
             }
         }
     """
+    # Get current year for loading metadata
+    current_year = datetime.now().year
+    
     # Load ALL agents from HuggingFace agents repo
     agents = load_agents_from_hf()
 
@@ -610,10 +611,10 @@ def group_metadata_by_date(metadata_list):
     return dict(grouped)
 
 
-def save_pr_metadata_to_hf(metadata_list, agent_identifier, year=None):
+def save_pr_metadata_to_hf(metadata_list, agent_identifier):
     """
-    Save PR metadata to HuggingFace dataset, organized by [year]/[agent_identifier]/YYYY.MM.DD.jsonl.
-    Each file is stored in the agent's folder under a year folder and named YYYY.MM.DD.jsonl for that day's PRs.
+    Save PR metadata to HuggingFace dataset, organized by [agent_identifier]/YYYY.MM.DD.jsonl.
+    Each file is stored in the agent's folder and named YYYY.MM.DD.jsonl for that day's PRs.
     In debug mode, saves to in-memory cache only.
 
     This function APPENDS new metadata and DEDUPLICATES by html_url.
@@ -621,7 +622,6 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier, year=None):
     Args:
         metadata_list: List of PR metadata dictionaries
         agent_identifier: GitHub identifier of the agent (used as folder name)
-        year: Year folder to use (defaults to current year)
     """
     # Skip saving to HF in debug mode - use in-memory cache instead
     if DEBUG_MODE:
@@ -641,15 +641,12 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier, year=None):
 
         api = HfApi()
 
-        if year is None:
-            year = datetime.now().year
-
         # Group by exact date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
 
         for (pr_year, month, day), day_metadata in grouped.items():
-            # New structure: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
-            filename = f"{pr_year}/{agent_identifier}/{pr_year}.{month:02d}.{day:02d}.jsonl"
+            # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
+            filename = f"{agent_identifier}/{pr_year}.{month:02d}.{day:02d}.jsonl"
             local_filename = f"{pr_year}.{month:02d}.{day:02d}.jsonl"
             print(f"📤 Uploading {len(day_metadata)} PRs to {filename}...")
 
@@ -702,10 +699,10 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier, year=None):
 def load_pr_metadata_for_year(year):
     """
     Load all PR metadata for a specific year from HuggingFace.
-    Scans year folder with all agent subfolders and loads all daily files.
+    Scans all agent folders and loads daily files matching the year.
     In debug mode, loads from in-memory cache if available.
 
-    Structure: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
+    Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Returns:
         List of dictionaries with 'agent_identifier' added to each PR metadata.
@@ -729,24 +726,31 @@ def load_pr_metadata_for_year(year):
         # List all files in the repository
         files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files in the year folder with daily pattern
-        # Format: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
-        year_prefix = f"{year}/"
-        year_files = [f for f in files if f.startswith(year_prefix) and f.endswith('.jsonl')]
+        # Filter for files matching the year pattern: [agent_identifier]/YYYY.MM.DD.jsonl
+        # Extract year from filename
+        year_str = str(year)
+        year_files = []
+        for f in files:
+            if f.endswith('.jsonl'):
+                parts = f.split('/')
+                if len(parts) == 2:  # [agent_identifier]/YYYY.MM.DD.jsonl
+                    filename = parts[1]
+                    if filename.startswith(year_str + '.'):
+                        year_files.append(f)
 
         print(f"📥 Loading PR metadata for {year} ({len(year_files)} daily files across all agents)...")
 
         all_metadata = []
         for filename in year_files:
             try:
-                # Extract agent_identifier from path (second part after year/)
-                # Format: year/agent_identifier/YYYY.MM.DD.jsonl
+                # Extract agent_identifier from path (first part)
+                # Format: agent_identifier/YYYY.MM.DD.jsonl
                 parts = filename.split('/')
-                if len(parts) < 3:
+                if len(parts) != 2:
                     print(f"   Warning: Unexpected filename format: {filename}")
                     continue
 
-                agent_identifier = parts[1]
+                agent_identifier = parts[0]
 
                 file_path = hf_hub_download(
                     repo_id=PR_METADATA_REPO,
@@ -773,16 +777,15 @@ def load_pr_metadata_for_year(year):
         return []
 
 
-def get_latest_pr_date_for_agent(agent_identifier, current_year):
+def get_latest_pr_date_for_agent(agent_identifier):
     """
     Get the latest PR creation date for an agent from stored metadata.
     Used for incremental updates - only fetch PRs newer than this date.
 
-    Structure: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
+    Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Args:
         agent_identifier: GitHub identifier of the agent
-        current_year: Year to check for metadata
 
     Returns:
         datetime or None if no existing PRs found.
@@ -794,10 +797,10 @@ def get_latest_pr_date_for_agent(agent_identifier, current_year):
         # List all files in the repository
         files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files in this agent's folder for the current year
-        # New structure: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
-        year_agent_pattern = f"{current_year}/{agent_identifier}/"
-        agent_files = [f for f in files if f.startswith(year_agent_pattern) and f.endswith('.jsonl')]
+        # Filter for files in this agent's folder
+        # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
+        agent_pattern = f"{agent_identifier}/"
+        agent_files = [f for f in files if f.startswith(agent_pattern) and f.endswith('.jsonl')]
 
         if not agent_files:
             return None
@@ -832,17 +835,16 @@ def get_latest_pr_date_for_agent(agent_identifier, current_year):
         return None
 
 
-def get_daily_files_last_n_months(agent_identifier, year, n_months=6):
+def get_daily_files_last_n_months(agent_identifier, n_months=6):
     """
     Get list of daily file paths for an agent from the last N months.
 
     Args:
         agent_identifier: GitHub identifier of the agent
-        year: Year to check
         n_months: Number of months to look back (default: 6)
 
     Returns:
-        List of file paths in format: [year]/[agent_identifier]/YYYY.MM.DD.jsonl
+        List of file paths in format: [agent_identifier]/YYYY.MM.DD.jsonl
     """
     try:
         api = HfApi()
@@ -855,9 +857,9 @@ def get_daily_files_last_n_months(agent_identifier, year, n_months=6):
         # List all files in the repository
         files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files in this agent's folder for the current year
-        year_agent_pattern = f"{year}/{agent_identifier}/"
-        agent_files = [f for f in files if f.startswith(year_agent_pattern) and f.endswith('.jsonl')]
+        # Filter for files in this agent's folder
+        agent_pattern = f"{agent_identifier}/"
+        agent_files = [f for f in files if f.startswith(agent_pattern) and f.endswith('.jsonl')]
 
         # Filter by date range (extract date from filename)
         recent_files = []
@@ -865,10 +867,10 @@ def get_daily_files_last_n_months(agent_identifier, year, n_months=6):
             try:
                 # Extract date from filename: YYYY.MM.DD.jsonl
                 parts = filename.split('/')
-                if len(parts) < 3:
+                if len(parts) != 2:
                     continue
 
-                date_part = parts[2].replace('.jsonl', '')  # Get YYYY.MM.DD
+                date_part = parts[1].replace('.jsonl', '')  # Get YYYY.MM.DD
                 date_components = date_part.split('.')
                 if len(date_components) != 3:
                     continue
@@ -934,7 +936,7 @@ def fetch_pr_current_status(pr_url, token):
         return None
 
 
-def refresh_open_prs_for_agent(agent_identifier, year, token):
+def refresh_open_prs_for_agent(agent_identifier, token):
     """
     Refresh status for all open PRs from the last 6 months for an agent.
     Only updates PRs that are still open (no merged_at, no closed_at).
@@ -946,7 +948,6 @@ def refresh_open_prs_for_agent(agent_identifier, year, token):
 
     Args:
         agent_identifier: GitHub identifier of the agent
-        year: Year to check
         token: GitHub API token
 
     Returns:
@@ -956,7 +957,7 @@ def refresh_open_prs_for_agent(agent_identifier, year, token):
 
     try:
         # Get daily files from last 6 months
-        recent_files = get_daily_files_last_n_months(agent_identifier, year, n_months=6)
+        recent_files = get_daily_files_last_n_months(agent_identifier, n_months=6)
 
         if not recent_files:
             print(f"   No recent files found for {agent_identifier}")
@@ -1254,7 +1255,7 @@ def update_all_agents_incremental():
             print(f"{'='*80}")
 
             # Check for existing metadata to determine incremental update date
-            latest_pr_date = get_latest_pr_date_for_agent(identifier, current_year)
+            latest_pr_date = get_latest_pr_date_for_agent(identifier)
 
             if latest_pr_date:
                 print(f"📅 Latest PR found: {latest_pr_date.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1419,8 +1420,7 @@ def create_monthly_metrics_plot():
 
     Each agent gets a unique color for both their line and bars.
     """
-    current_year = datetime.now().year
-    metrics = calculate_monthly_metrics_by_agent(current_year)
+    metrics = calculate_monthly_metrics_by_agent()
 
     if not metrics['agents'] or not metrics['months']:
         # Return an empty figure with a message
@@ -1693,7 +1693,6 @@ def daily_update_task():
 
     try:
         token = get_github_token()
-        current_year = datetime.now().year
 
         # Load all agents
         agents = load_agents_from_hf()
@@ -1719,7 +1718,7 @@ def daily_update_task():
             print(f"{'='*60}")
 
             # Refresh open PRs from last 6 months
-            checked, updated = refresh_open_prs_for_agent(identifier, current_year, token)
+            checked, updated = refresh_open_prs_for_agent(identifier, token)
             total_checked += checked
             total_updated += updated
 
