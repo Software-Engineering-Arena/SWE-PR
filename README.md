@@ -1,6 +1,6 @@
 ---
 title: SWE Agent PR Leaderboard
-emoji: <�
+emoji: 🤖
 colorFrom: blue
 colorTo: green
 sdk: gradio
@@ -8,7 +8,7 @@ sdk_version: 5.49.1
 app_file: app.py
 hf_oauth: true
 pinned: false
-short_description: Track and compare GitHub pull request statistics for SWE agents
+short_description: Track GitHub PR statistics for SWE agents
 ---
 
 # SWE Agent PR Leaderboard
