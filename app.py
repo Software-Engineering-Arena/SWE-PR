@@ -21,8 +21,7 @@ load_dotenv()
 # =============================================================================
 
 CACHE_FILE = "agent_pr_cache.jsonl"
-AGENTS_FILE = "agent_metadata.jsonl"
-SUBMISSIONS_REPO = "SWE-Arena/pr_submissions"
+AGENTS_REPO = "SWE-Arena/pr_agents"  # HuggingFace dataset for agent metadata
 LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
 UPDATE_INTERVAL = 86400  # 24 hours in seconds
 
@@ -69,7 +68,7 @@ def save_jsonl(filename, data):
 
 def cache_to_dict(cache_list):
     """Convert list of cache entries to dictionary by identifier."""
-    return {entry['identifier']: entry for entry in cache_list}
+    return {entry['github_identifier']: entry for entry in cache_list}
 
 
 def dict_to_cache(cache_dict):
@@ -106,7 +105,7 @@ def normalize_date_format(date_string):
 # =============================================================================
 
 def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None,
-                         max_retries=6, timeout=30):
+                         max_retries=10, timeout=60):
     """
     Perform an HTTP request with exponential backoff and jitter for GitHub API.
     Retries on 403/429 (rate limits), 5xx server errors, and transient network exceptions.
@@ -188,7 +187,7 @@ def get_github_token():
 
 
 def validate_github_username(identifier):
-    """Verify that a GitHub username exists with backoff-aware requests."""
+    """Verify that a GitHub identifier exists with backoff-aware requests."""
     try:
         token = get_github_token()
         headers = {'Authorization': f'token {token}'} if token else {}
@@ -199,7 +198,7 @@ def validate_github_username(identifier):
         if response.status_code == 200:
             return True, "Username is valid"
         elif response.status_code == 404:
-            return False, "GitHub username not found"
+            return False, "GitHub identifier not found"
         else:
             return False, f"Validation error: HTTP {response.status_code}"
     except Exception as e:
@@ -221,8 +220,8 @@ def fetch_all_prs(identifier, token=None):
     # Define all query patterns to search
     query_patterns = [
         f'is:pr author:{identifier}',
-        # f'is:pr head:{identifier}/',
-        # f'is:pr "Co-Authored-By: {identifier}"'
+        f'is:pr head:{identifier}/',
+        f'is:pr "Co-Authored-By: {identifier}"'
     ]
 
     # Use a dict to deduplicate PRs by ID
@@ -349,7 +348,7 @@ def fetch_agent_stats(identifier, token=None):
     print(f"Fetching data for {identifier}...")
     prs = fetch_all_prs(identifier, token)
     stats = calculate_pr_stats(prs)
-    stats['identifier'] = identifier
+    stats['github_identifier'] = identifier
     return stats
 
 
@@ -357,21 +356,42 @@ def fetch_agent_stats(identifier, token=None):
 # HUGGINGFACE DATASET OPERATIONS
 # =============================================================================
 
-def load_submissions_dataset():
-    """Load agent submissions from HuggingFace dataset."""
+def load_agents_from_hf():
+    """Load all agent metadata JSON files from HuggingFace dataset."""
     try:
-        dataset = load_dataset(SUBMISSIONS_REPO, split='train')
-        submissions = []
-        for row in dataset:
-            submissions.append({
-                'agent_name': row.get('agent_name', 'Unknown'),
-                'identifier': row.get('identifier'),
-                'organization': row.get('organization', 'Unknown'),
-            })
-        print(f"✓ Loaded {len(submissions)} submissions from HuggingFace")
-        return submissions
+        api = HfApi()
+        agents = []
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=AGENTS_REPO, repo_type="dataset")
+
+        # Filter for JSON files only
+        json_files = [f for f in files if f.endswith('.json')]
+
+        print(f"Found {len(json_files)} agent files in {AGENTS_REPO}")
+
+        # Download and parse each JSON file
+        for json_file in json_files:
+            try:
+                file_path = hf_hub_download(
+                    repo_id=AGENTS_REPO,
+                    filename=json_file,
+                    repo_type="dataset"
+                )
+
+                with open(file_path, 'r') as f:
+                    agent_data = json.load(f)
+                    agents.append(agent_data)
+
+            except Exception as e:
+                print(f"Warning: Could not load {json_file}: {str(e)}")
+                continue
+
+        print(f"✓ Loaded {len(agents)} agents from HuggingFace")
+        return agents
+
     except Exception as e:
-        print(f"Could not load submissions dataset: {str(e)}")
+        print(f"Could not load agents from HuggingFace: {str(e)}")
         return None
 
 
@@ -400,45 +420,38 @@ def load_leaderboard_dataset():
 
 
 def save_agent_to_hf(data):
-    """Save a new agent to HuggingFace dataset."""
+    """Save a new agent to HuggingFace dataset as {identifier}.json in root."""
     try:
         api = HfApi()
         token = HfFolder.get_token()
-        
+
         if not token:
             raise Exception("No HuggingFace token found")
-        
-        # Create timestamped filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        year = datetime.now().year
-        identifier = data['identifier']
-        filename = f"{year}/{timestamp}_{identifier}.json"
-        
+
+        identifier = data['github_identifier']
+        filename = f"{identifier}.json"
+
         # Save locally first
-        os.makedirs(str(year), exist_ok=True)
-        filepath = f"{year}/{timestamp}_{identifier}.json"
-        
-        with open(filepath, 'w') as f:
+        with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
-        
-        # Upload to HuggingFace
+
+        # Upload to HuggingFace (root directory)
         api.upload_file(
-            path_or_fileobj=filepath,
+            path_or_fileobj=filename,
             path_in_repo=filename,
-            repo_id=SUBMISSIONS_REPO,
+            repo_id=AGENTS_REPO,
             repo_type="dataset",
             token=token
         )
-        
-        # Clean up
-        os.remove(filepath)
-        os.rmdir(str(year))
-        
-        print(f"✓ Saved submission to HuggingFace: {filename}")
+
+        # Clean up local file
+        os.remove(filename)
+
+        print(f"✓ Saved agent to HuggingFace: {filename}")
         return True
-        
+
     except Exception as e:
-        print(f"✗ Error saving submission: {str(e)}")
+        print(f"✗ Error saving agent: {str(e)}")
         return False
 
 
@@ -485,88 +498,78 @@ def save_leaderboard_to_hf(cache_dict):
 
 def update_all_agents():
     """
-    Update PR statistics for all agents in the metadata file.
+    Update PR statistics for all agents from HuggingFace dataset.
     Returns dictionary of all agent data with current stats.
     """
     token = get_github_token()
-    
-    # Load agent metadata
-    agents = load_jsonl(AGENTS_FILE)
+
+    # Load agent metadata from HuggingFace
+    agents = load_agents_from_hf()
     if not agents:
-        print("No agents found in metadata file")
+        print("No agents found in HuggingFace dataset")
         return {}
-    
+
     # Load existing cache
     cache_list = load_jsonl(CACHE_FILE)
     cache_dict = cache_to_dict(cache_list)
-    
+
     # Update each agent
     for agent in agents:
-        identifier = agent.get('identifier')
+        identifier = agent.get('github_identifier')
         if not identifier:
             print(f"Warning: Skipping agent without identifier: {agent}")
             continue
-        
+
         try:
             # Fetch fresh PR statistics
             stats = fetch_agent_stats(identifier, token)
-            
+
             # Merge metadata with stats
             cache_dict[identifier] = {
                 'agent_name': agent.get('agent_name', 'Unknown'),
                 'organization': agent.get('organization', 'Unknown'),
-                'identifier': identifier,
+                'github_identifier': identifier,
                 **stats
             }
-            
+
             # Progressive save
             save_jsonl(CACHE_FILE, dict_to_cache(cache_dict))
             print(f"✓ Updated {identifier}")
-            
+
         except Exception as e:
             print(f"✗ Error updating {identifier}: {str(e)}")
             continue
-    
+
     return cache_dict
 
 
 def initialize_data():
     """
     Initialize data on application startup.
-    Priority: Leaderboard dataset > Submissions dataset > Local files
+    Priority: Leaderboard dataset > HuggingFace agents dataset
     """
     print("🚀 Initializing leaderboard data...")
-    
+
     # Try loading existing leaderboard
     leaderboard_data = load_leaderboard_dataset()
     if leaderboard_data:
         save_jsonl(CACHE_FILE, leaderboard_data)
         print("✓ Initialized from leaderboard dataset")
         return
-    
-    # Try loading submissions and mining GitHub data
-    submissions_data = load_submissions_dataset()
-    if submissions_data:
-        save_jsonl(AGENTS_FILE, submissions_data)
-        print("✓ Loaded metadata from submissions dataset")
+
+    # Try loading agents from HuggingFace and mining GitHub data
+    agents = load_agents_from_hf()
+    if agents:
+        print(f"✓ Loaded {len(agents)} agents from HuggingFace")
         print("⛏️ Mining GitHub data...")
         cache_dict = update_all_agents()
         if cache_dict:
             save_leaderboard_to_hf(cache_dict)
         return
-    
-    # Check local metadata file
-    agents = load_jsonl(AGENTS_FILE)
-    if agents:
-        print(f"✓ Found {len(agents)} agents in local metadata")
-        print("⛏️ Mining GitHub data...")
-        cache_dict = update_all_agents()
-        if cache_dict:
-            save_leaderboard_to_hf(cache_dict)
-    else:
-        print("⚠️ No data sources available. Waiting for first submission...")
-        save_jsonl(AGENTS_FILE, [])
-        save_jsonl(CACHE_FILE, [])
+
+    # No data available
+    print("⚠️ No data sources available. Waiting for first submission...")
+    save_jsonl(CACHE_FILE, [])
 
 
 # =============================================================================
@@ -632,7 +635,7 @@ def submit_agent(identifier, agent_name, organization, description, website):
     """
     # Validate required fields
     if not identifier or not identifier.strip():
-        return "❌ GitHub username is required", get_leaderboard_dataframe()
+        return "❌ GitHub identifier is required", get_leaderboard_dataframe()
     if not agent_name or not agent_name.strip():
         return "❌ Agent name is required", get_leaderboard_dataframe()
     if not organization or not organization.strip():
@@ -647,34 +650,30 @@ def submit_agent(identifier, agent_name, organization, description, website):
     description = description.strip()
     website = website.strip()
 
-    # Validate GitHub username
+    # Validate GitHub identifier
     is_valid, message = validate_github_username(identifier)
     if not is_valid:
         return f"❌ {message}", get_leaderboard_dataframe()
-    
-    # Check for duplicates
-    agents = load_jsonl(AGENTS_FILE)
-    existing_names = {agent['identifier'] for agent in agents}
-    
-    if identifier in existing_names:
-        return f"⚠️ Agent with identifier '{identifier}' already exists", get_leaderboard_dataframe()
-    
+
+    # Check for duplicates by loading agents from HuggingFace
+    agents = load_agents_from_hf()
+    if agents:
+        existing_names = {agent['github_identifier'] for agent in agents}
+        if identifier in existing_names:
+            return f"⚠️ Agent with identifier '{identifier}' already exists", get_leaderboard_dataframe()
+
     # Create submission
     submission = {
         'agent_name': agent_name,
         'organization': organization,
-        'identifier': identifier,
+        'github_identifier': identifier,
         'description': description,
         'website': website,
     }
-    
+
     # Save to HuggingFace
     if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe()
-    
-    # Add to local metadata
-    agents.append(submission)
-    save_jsonl(AGENTS_FILE, agents)
     
     # Fetch PR data immediately
     token = get_github_token()
@@ -767,7 +766,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
             with gr.Row():
                 with gr.Column():
                     github_input = gr.Textbox(
-                        label="GitHub Username*",
+                        label="GitHub Identifier*",
                         placeholder="octocat"
                     )
                     name_input = gr.Textbox(
