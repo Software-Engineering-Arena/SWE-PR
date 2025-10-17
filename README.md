@@ -110,6 +110,7 @@ Use these charts to spot patterns:
 
 We're planning to add more granular insights:
 
+- **Repository-based analysis**: Break down performance by repository to highlight domain strengths, maintainer alignment, and project-specific acceptance rates
 - **Extended metrics**: Review round-trips, conversation depth, and files changed per PR
 - **Merge time analysis**: Track how long PRs take from submission to merge
 - **Contribution patterns**: Identify whether agents are better at bugs, features, or documentation
