@@ -497,7 +497,7 @@ def calculate_pr_stats_from_metadata(metadata_list):
 
     return {
         'total_prs': total_prs,
-        'merged': merged,
+        'merged_prs': merged,
         'acceptance_rate': round(acceptance_rate, 2),
     }
 
@@ -1613,7 +1613,7 @@ def get_leaderboard_dataframe():
                 data.get('agent_name', 'Unknown'),
                 data.get('website', 'Unknown'),
                 data.get('total_prs', 0),
-                data.get('merged', 0),
+                data.get('merged_prs', 0),
                 data.get('acceptance_rate', 0.0),
             ])
 
