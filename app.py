@@ -50,7 +50,6 @@ DEBUG_PR_METADATA_CACHE = defaultdict(list)
 AGENTS_REPO = "SWE-Arena/pr_agents"  # HuggingFace dataset for agent metadata
 LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"  # HuggingFace dataset for PR metadata
-UPDATE_INTERVAL = 86400  # 24 hours in seconds
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
