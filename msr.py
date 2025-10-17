@@ -306,15 +306,16 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     debug_limit_per_pattern = 10 if DEBUG_MODE else None
     if DEBUG_MODE:
         print(f"\n🐛 DEBUG MODE ENABLED: Limiting to {debug_limit_per_pattern} PRs per query pattern")
-    # Define all query patterns to search
-    base_patterns = [
-        f'is:pr author:{identifier}',
-        f'is:pr "co-authored-by: {identifier}"',
-        f'is:pr head:{identifier}/',
-    ]
-    query_patterns = base_patterns + (
-        [p.replace('[bot]', '') for p in base_patterns] if '[bot]' in identifier else []
-    )
+    # Define query patterns per rules:
+    # 1) author pattern only if identifier contains "[bot]"
+    # 2) co-author and head patterns use identifier with "[bot]" removed
+    stripped_id = identifier.replace('[bot]', '')
+    query_patterns = []
+    if '[bot]' in identifier:
+        query_patterns.append(f'is:pr author:{identifier}')
+    if stripped_id:
+        query_patterns.append(f'is:pr "co-authored-by: {stripped_id}"')
+        query_patterns.append(f'is:pr head:{stripped_id}/')
     prs_by_id = {}
     current_time = datetime.now(timezone.utc)
     six_months_ago = current_time - timedelta(days=180)
