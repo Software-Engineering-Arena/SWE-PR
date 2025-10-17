@@ -625,15 +625,19 @@ def get_already_mined_dates(agent_identifier, n_months=6):
 def save_leaderboard_to_hf(cache_dict):
     if DEBUG_MODE:
         global DEBUG_LEADERBOARD_CACHE
-        DEBUG_LEADERBOARD_CACHE = cache_dict.copy()
-        data_list = dict_to_cache(cache_dict)
+        # Filter out agents with zero total PRs
+        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
+        DEBUG_LEADERBOARD_CACHE = filtered_cache_dict.copy()
+        data_list = dict_to_cache(filtered_cache_dict)
         print(f"🐛 DEBUG MODE: Saved to in-memory cache only ({len(data_list)} entries) - NOT saved to HuggingFace")
         return True
     try:
         token = get_hf_token()
         if not token:
             raise Exception("No HuggingFace token found. Please set HF_TOKEN in your environment.")
-        data_list = dict_to_cache(cache_dict)
+        # Filter out agents with zero total PRs
+        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
+        data_list = dict_to_cache(filtered_cache_dict)
         df = pd.DataFrame(data_list)
         year = datetime.now().year
         filename = f"{year}.csv"

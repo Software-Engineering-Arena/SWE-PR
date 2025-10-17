@@ -1303,8 +1303,10 @@ def save_leaderboard_to_hf(cache_dict):
     # Skip saving in debug mode - use in-memory cache instead
     if DEBUG_MODE:
         global DEBUG_LEADERBOARD_CACHE
-        DEBUG_LEADERBOARD_CACHE = cache_dict.copy()
-        data_list = dict_to_cache(cache_dict)
+        # Filter out agents with zero total PRs
+        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
+        DEBUG_LEADERBOARD_CACHE = filtered_cache_dict.copy()
+        data_list = dict_to_cache(filtered_cache_dict)
         print(f"🐛 DEBUG MODE: Saved to in-memory cache only ({len(data_list)} entries) - NOT saved to HuggingFace")
         return True
 
@@ -1313,8 +1315,10 @@ def save_leaderboard_to_hf(cache_dict):
         if not token:
             raise Exception("No HuggingFace token found. Please set HF_TOKEN in your Space settings.")
 
+        # Filter out agents with zero total PRs
+        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
         # Convert to DataFrame
-        data_list = dict_to_cache(cache_dict)
+        data_list = dict_to_cache(filtered_cache_dict)
         df = pd.DataFrame(data_list)
 
         # Save to CSV with year as filename
@@ -1492,7 +1496,7 @@ def construct_leaderboard_from_metadata():
 def initialize_data():
     """
     Initialize data on application startup.
-    Priority: 1) Leaderboard dataset, 2) PR metadata (if available), 3) Full GitHub mining
+    Priority: 1) Leaderboard dataset ({year}.csv), 2) PR metadata (if available), 3) Full GitHub mining
 
     In DEBUG MODE:
     - If no data available, automatically mine up to 10 PRs per query per agent
@@ -1500,23 +1504,33 @@ def initialize_data():
     """
     print("🚀 Initializing leaderboard data...")
 
-    # Try loading existing leaderboard
+    year = datetime.now().year
+
+    # STEP 1: Try loading existing leaderboard CSV from SWE-Arena/pr_leaderboard
+    print(f"STEP 1: Checking for {year}.csv in SWE-Arena/pr_leaderboard...")
     leaderboard_data = load_leaderboard_dataset()
     if leaderboard_data:
+        print(f"✓ Found and loaded {year}.csv from leaderboard repository")
         print("✓ Initialized from leaderboard dataset")
         return
 
-    # Try constructing from PR metadata (fast, memory-efficient)
+    print(f"   {year}.csv not found in leaderboard repository")
+
+    # STEP 2: Try constructing from PR metadata in SWE-Arena/pr_metadata (fast, memory-efficient)
+    print(f"STEP 2: Checking SWE-Arena/pr_metadata for existing data...")
     try:
         cache_dict = construct_leaderboard_from_metadata()
         # Check if there's actually meaningful data (at least one agent with PRs)
         has_data = any(entry.get('total_prs', 0) > 0 for entry in cache_dict.values())
         if cache_dict and has_data:
+            print(f"✓ Found PR metadata in pr_metadata repository")
             save_leaderboard_to_hf(cache_dict)
-            print("✓ Initialized from PR metadata")
+            print("✓ Initialized from PR metadata and saved as CSV")
             return
+        else:
+            print("   No meaningful PR metadata found in pr_metadata repository")
     except Exception as e:
-        print(f"Could not construct from metadata: {e}")
+        print(f"   Could not construct from metadata: {e}")
 
     # If in debug mode and no data available, mine immediately
     if DEBUG_MODE:
@@ -1688,14 +1702,16 @@ def get_leaderboard_dataframe():
 
     rows = []
     for data in leaderboard_data:
-        # Only include display-relevant fields
-        rows.append([
-            data.get('agent_name', 'Unknown'),
-            data.get('organization', 'Unknown'),
-            data.get('total_prs', 0),
-            data.get('merged', 0),
-            data.get('acceptance_rate', 0.0),
-        ])
+        # Filter out agents with zero total PRs
+        if data.get('total_prs', 0) > 0:
+            # Only include display-relevant fields
+            rows.append([
+                data.get('agent_name', 'Unknown'),
+                data.get('organization', 'Unknown'),
+                data.get('total_prs', 0),
+                data.get('merged', 0),
+                data.get('acceptance_rate', 0.0),
+            ])
 
     # Create DataFrame
     column_names = [col[0] for col in LEADERBOARD_COLUMNS]
