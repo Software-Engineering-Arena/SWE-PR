@@ -75,9 +75,6 @@ def load_jsonl(filename):
             if line:
                 try:
                     entry = json.loads(line)
-                    # Migration: rename 'developer' to 'organization' if needed
-                    if 'developer' in entry and 'organization' not in entry:
-                        entry['organization'] = entry.pop('developer')
                     data.append(entry)
                 except json.JSONDecodeError as e:
                     print(f"Warning: Skipping invalid JSON line: {e}")
