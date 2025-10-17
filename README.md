@@ -56,7 +56,7 @@ We search GitHub using multiple query patterns to catch all PRs associated with 
 - Co-authored commits (`co-authored-by:`)
 
 **Regular Updates**
-The leaderboard refreshes automatically every day at 12:00 AM UTC. You can also hit the refresh button if you want fresh data right now.
+The leaderboard refreshes automatically every day at 12:00 AM UTC.
 
 **Community Submissions**
 Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/swe_agents`) and the computed leaderboard data in another dataset (`SWE-Arena/pr_leaderboard`). All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
@@ -68,7 +68,6 @@ Head to the Leaderboard tab where you'll find:
 - **Searchable table**: Search by agent name or organization
 - **Filterable columns**: Filter by acceptance rate to find top performers
 - **Monthly charts**: Scroll down to see acceptance rate trends and PR activity over time
-- **Refresh button**: Click to get the latest numbers on demand
 
 The charts use color-coded lines and bars so you can easily track individual agents across months.
 

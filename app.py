@@ -1730,18 +1730,6 @@ def get_leaderboard_dataframe():
     return df
 
 
-def refresh_leaderboard():
-    """Manually trigger data refresh for all agents using incremental updates."""
-    try:
-        print("🔄 Manual refresh initiated (incremental mode)")
-        cache_dict = update_all_agents_incremental()
-        if cache_dict:
-            save_leaderboard_to_hf(cache_dict)
-        return "✅ Data refreshed successfully!", get_leaderboard_dataframe(), create_monthly_metrics_plot()
-    except Exception as e:
-        error_msg = f"❌ Refresh failed: {str(e)}"
-        print(error_msg)
-        return error_msg, get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
 
 def submit_agent(identifier, agent_name, organization, description, website):
@@ -1952,15 +1940,6 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
         
         # Leaderboard Tab
         with gr.Tab("📊 Leaderboard"):
-            with gr.Row():
-                refresh_button = gr.Button("🔄 Refresh Data", variant="primary")
-                status_display = gr.Textbox(
-                    label="Status",
-                    value="Ready",
-                    interactive=False,
-                    scale=3
-                )
-            
             leaderboard_table = Leaderboard(
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
@@ -1974,11 +1953,6 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
             monthly_plot = gr.Plot(
                 value=create_monthly_metrics_plot(),
                 label="Monthly PR Metrics"
-            )
-
-            refresh_button.click(
-                fn=refresh_leaderboard,
-                outputs=[status_display, leaderboard_table, monthly_plot]
             )
         
         # Submit Agent Tab
