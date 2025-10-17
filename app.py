@@ -1814,12 +1814,14 @@ print("✓ Scheduler started: Daily updates at 12:00 AM UTC")
 with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
     
     gr.Markdown("# 🏆 SWE Agent PR Leaderboard")
-    gr.Markdown("Track and compare GitHub pull request statistics for SWE agents")
+    gr.Markdown("Track and compare GitHub pull request statistics for SWE agents (last 6 months)")
     
     with gr.Tabs():
         
         # Leaderboard Tab
         with gr.Tab("📊 Leaderboard"):
+            gr.Markdown("*All statistics are based on PRs from the last 6 months*")
+
             leaderboard_table = Leaderboard(
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,

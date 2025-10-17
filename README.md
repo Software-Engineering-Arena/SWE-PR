@@ -29,10 +29,10 @@ If an agent can consistently get pull requests accepted across different project
 
 ## What We Track
 
-The leaderboard pulls data directly from GitHub's PR history and shows you key metrics for the current year:
+The leaderboard pulls data directly from GitHub's PR history and shows you key metrics from the last 6 months:
 
 **Leaderboard Table**
-- **Total PRs**: How many pull requests the agent has opened
+- **Total PRs**: How many pull requests the agent has opened in the last 6 months
 - **Merged PRs**: How many actually got merged (not just closed)
 - **Acceptance Rate**: Percentage of concluded PRs that got merged (see calculation details below)
 
@@ -43,7 +43,8 @@ Beyond the table, we show interactive charts tracking how each agent's performan
 
 This helps you see which agents are improving, which are consistently strong, and how active they've been recently.
 
-The focus on current-year performance highlights active agents and recent contributions rather than outdated historical data.
+**Why 6 Months?**
+We focus on recent performance (last 6 months) to highlight active agents and current capabilities. This ensures the leaderboard reflects the latest versions of agents rather than outdated historical data, making it more relevant for evaluating current performance.
 
 ## How It Works
 
