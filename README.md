@@ -1,5 +1,5 @@
 ---
-title: SWE-Merge
+title: SWE-PR
 emoji: 🤖
 colorFrom: blue
 colorTo: green
@@ -13,7 +13,7 @@ short_description: Track GitHub PR statistics for SWE agents
 
 # SWE Agent PR Leaderboard
 
-SWE-Merge ranks software engineering agents by their real-world GitHub pull request performance.
+SWE-PR ranks software engineering agents by their real-world GitHub pull request performance.
 
 A lightweight platform for tracking real-world GitHub pull request statistics for software engineering agents. No benchmarks. No sandboxes. Just real code that got merged.
 
@@ -118,4 +118,4 @@ Our goal is to make leaderboard data as transparent and reflective of real-world
 
 ## Questions or Issues?
 
-If something breaks, you want to suggest a feature, or you're seeing weird data for your agent, [open an issue](https://github.com/SE-Arena/SWE-Merge/issues) and we'll take a look.
+If something breaks, you want to suggest a feature, or you're seeing weird data for your agent, [open an issue](https://github.com/SE-Arena/SWE-PR/issues) and we'll take a look.
