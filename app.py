@@ -224,13 +224,14 @@ def validate_github_username(identifier):
         return False, f"Validation error: {str(e)}"
 
 
-def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None):
+def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None, depth=0):
     """
     Fetch PRs within a specific time range using time-based partitioning.
     Recursively splits the time range if hitting the 1000-result limit.
 
     Args:
         debug_limit: If set, stops fetching after this many PRs (for testing)
+        depth: Current recursion depth (for tracking)
 
     Returns the number of PRs found in this time partition.
     """
@@ -241,7 +242,8 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
     # Add date range to query
     query = f'{base_query} created:{start_str}..{end_str}'
 
-    print(f"  Searching range {start_str} to {end_str}...")
+    indent = "  " + "  " * depth
+    print(f"{indent}Searching range {start_str} to {end_str}...")
 
     page = 1
     per_page = 100
@@ -250,7 +252,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
     while True:
         # Check debug limit
         if debug_limit is not None and total_in_partition >= debug_limit:
-            print(f"    🐛 DEBUG MODE: Reached limit of {debug_limit} PRs, stopping...")
+            print(f"{indent}  🐛 DEBUG MODE: Reached limit of {debug_limit} PRs, stopping...")
             return total_in_partition
         url = 'https://api.github.com/search/issues'
         params = {
@@ -264,11 +266,11 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
         try:
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
-                print(f"    Error: retries exhausted for range {start_str} to {end_str}")
+                print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
 
             if response.status_code != 200:
-                print(f"    Error: HTTP {response.status_code} for range {start_str} to {end_str}")
+                print(f"{indent}  Error: HTTP {response.status_code} for range {start_str} to {end_str}")
                 return total_in_partition
 
             data = response.json()
@@ -287,17 +289,52 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
 
             # Check if we hit the 1000-result limit
             if total_count > 1000 and page == 10:
-                print(f"    ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
+                print(f"{indent}  ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
 
-                # Calculate midpoint
+                # Calculate time range in days
                 time_diff = end_date - start_date
-                mid_date = start_date + time_diff / 2
+                days_diff = time_diff.days
 
-                # Recursively fetch both halves
-                count1 = fetch_prs_with_time_partition(base_query, start_date, mid_date, headers, prs_by_id, debug_limit)
-                count2 = fetch_prs_with_time_partition(base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit)
+                # Use aggressive splitting for large ranges or deep recursion
+                # Split into 4 parts if range is > 30 days, otherwise split in half
+                if days_diff > 30 or depth > 5:
+                    # Split into 4 parts for more aggressive partitioning
+                    quarter_diff = time_diff / 4
+                    split_dates = [
+                        start_date,
+                        start_date + quarter_diff,
+                        start_date + quarter_diff * 2,
+                        start_date + quarter_diff * 3,
+                        end_date
+                    ]
 
-                return count1 + count2
+                    total_from_splits = 0
+                    for i in range(4):
+                        split_start = split_dates[i]
+                        split_end = split_dates[i + 1]
+                        # Avoid overlapping ranges
+                        if i > 0:
+                            split_start = split_start + timedelta(days=1)
+
+                        count = fetch_prs_with_time_partition(
+                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                        )
+                        total_from_splits += count
+
+                    return total_from_splits
+                else:
+                    # Binary split for smaller ranges
+                    mid_date = start_date + time_diff / 2
+
+                    # Recursively fetch both halves
+                    count1 = fetch_prs_with_time_partition(
+                        base_query, start_date, mid_date, headers, prs_by_id, debug_limit, depth + 1
+                    )
+                    count2 = fetch_prs_with_time_partition(
+                        base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit, depth + 1
+                    )
+
+                    return count1 + count2
 
             # Normal pagination: check if there are more pages
             if len(items) < per_page or page >= 10:
@@ -307,11 +344,11 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
             time.sleep(0.5)  # Courtesy delay between pages
 
         except Exception as e:
-            print(f"    Error fetching range {start_str} to {end_str}: {str(e)}")
+            print(f"{indent}  Error fetching range {start_str} to {end_str}: {str(e)}")
             return total_in_partition
 
     if total_in_partition > 0:
-        print(f"    ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
+        print(f"{indent}  ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
 
     return total_in_partition
 
