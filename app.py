@@ -378,11 +378,15 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
         print(f"\n🐛 DEBUG MODE ENABLED: Limiting to {debug_limit_per_pattern} PRs per query pattern")
 
     # Define all query patterns to search
-    query_patterns = [
+    base_patterns = [
         f'is:pr author:{identifier}',
         f'is:pr "co-authored-by: {identifier}"',
         f'is:pr head:{identifier}/',
     ]
+    
+    query_patterns = base_patterns + (
+        [p.replace('[bot]', '') for p in base_patterns] if '[bot]' in identifier else []
+    )
 
     # Use a dict to deduplicate PRs by ID
     prs_by_id = {}
