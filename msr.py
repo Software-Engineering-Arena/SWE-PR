@@ -64,11 +64,9 @@ else:
 # Constants (match app.py)
 # =============================================================================
 
-DEBUG_LEADERBOARD_CACHE = {}
 DEBUG_PR_METADATA_CACHE = defaultdict(list)
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
-LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
 
 
@@ -622,45 +620,6 @@ def get_already_mined_dates(agent_identifier, n_months=6):
         return set()
 
 
-def save_leaderboard_to_hf(cache_dict):
-    if DEBUG_MODE:
-        global DEBUG_LEADERBOARD_CACHE
-        # Filter out agents with zero total PRs
-        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
-        DEBUG_LEADERBOARD_CACHE = filtered_cache_dict.copy()
-        data_list = dict_to_cache(filtered_cache_dict)
-        print(f"🐛 DEBUG MODE: Saved to in-memory cache only ({len(data_list)} entries) - NOT saved to HuggingFace")
-        return True
-    try:
-        token = get_hf_token()
-        if not token:
-            raise Exception("No HuggingFace token found. Please set HF_TOKEN in your environment.")
-        # Filter out agents with zero total PRs
-        filtered_cache_dict = {k: v for k, v in cache_dict.items() if v.get('total_prs', 0) > 0}
-        data_list = dict_to_cache(filtered_cache_dict)
-        df = pd.DataFrame(data_list)
-        year = datetime.now().year
-        filename = f"{year}.csv"
-        df.to_csv(filename, index=False)
-        api = HfApi()
-        try:
-            upload_with_retry(
-                api=api,
-                path_or_fileobj=filename,
-                path_in_repo=filename,
-                repo_id=LEADERBOARD_REPO,
-                repo_type="dataset",
-                token=token
-            )
-            print(f"✓ Saved leaderboard to HuggingFace as {filename} ({len(data_list)} entries)")
-            return True
-        finally:
-            # Always clean up local file, even if upload fails
-            if os.path.exists(filename):
-                os.remove(filename)
-    except Exception as e:
-        print(f"✗ Error saving leaderboard: {str(e)}")
-        return False
 
 
 def calculate_pr_stats_from_metadata(metadata_list):
@@ -745,7 +704,7 @@ def update_all_agents_incremental():
             stats = calculate_pr_stats_from_metadata(agent_metadata)
             cache_dict[identifier] = {
                 'agent_name': agent_name,
-                'organization': agent.get('organization', 'Unknown'),
+                'website': agent.get('website', 'Unknown'),
                 'github_identifier': identifier,
                 **stats
             }
@@ -761,8 +720,6 @@ def update_all_agents_incremental():
 def run_once():
     print("\n🚀 Immediate mining run started")
     cache_dict = update_all_agents_incremental()
-    if cache_dict:
-        save_leaderboard_to_hf(cache_dict)
     print("✅ Immediate mining run completed\n")
 
 
