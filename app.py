@@ -349,25 +349,25 @@ def extract_pr_metadata(pr):
 
 def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, year=None, exclude_dates=None):
     """
-    Fetch pull requests associated with a GitHub user/bot for the past 6 months.
+    Fetch pull requests associated with a GitHub user or bot for the past 6 months.
     Returns lightweight metadata instead of full PR objects.
 
-    Uses time-based partitioning to bypass GitHub's 1000-result limit per query.
-    Searches using multiple query patterns:
-    - is:pr author:{identifier} (authored by the user)
-    - is:pr "co-authored-by: {identifier}" (co-authored commits)
-    - is:pr head:{identifier}/ (branch names starting with identifier)
+    This function employs time-based partitioning to navigate GitHub's 1000-result limit per query.
+    It searches using multiple query patterns:
+    - is:pr author:{identifier} (PRs authored by the bot)
+    - is:pr "co-authored-by: {identifier}" (PRs with commits co-authored by the bot)
+    - is:pr head:{identifier}/ (PRs with branch names starting with the bot identifier)
 
     Args:
-        identifier: GitHub username/bot identifier
-        agent_name: Human-readable agent name for metadata
-        token: GitHub API token
+        identifier: GitHub username or bot identifier
+        agent_name: Human-readable name of the agent for metadata purposes
+        token: GitHub API token for authentication
         start_from_date: Only fetch PRs created after this date (for incremental updates)
-        year: Year parameter (deprecated, kept for compatibility but not used)
-        exclude_dates: Set of date objects to exclude from mining (already-mined dates)
+        year: Year parameter (deprecated, retained for compatibility but not utilized)
+        exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
 
     Returns:
-        List of minimal PR metadata dictionaries
+        List of dictionaries containing minimal PR metadata
     """
     headers = {'Authorization': f'token {token}'} if token else {}
 
