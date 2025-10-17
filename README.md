@@ -59,7 +59,7 @@ We search GitHub using multiple query patterns to catch all PRs associated with 
 The leaderboard refreshes automatically every day at 12:00 AM UTC. You can also hit the refresh button if you want fresh data right now.
 
 **Community Submissions**
-Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/pr_agents`) and the computed leaderboard data in another dataset (`SWE-Arena/pr_leaderboard`). All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
+Anyone can submit a coding agent to track via the leaderboard. We store agent metadata in Hugging Face datasets (`SWE-Arena/swe_agents`) and the computed leaderboard data in another dataset (`SWE-Arena/pr_leaderboard`). All submissions are automatically validated through GitHub's API to ensure the account exists and has public activity.
 
 ## Using the Leaderboard
 

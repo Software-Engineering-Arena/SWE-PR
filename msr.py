@@ -5,7 +5,7 @@ This script reuses the same logic and on-disk/HuggingFace formats as app.py, but
 has no UI or scheduler. You can run it once, or run it in a loop for hours.
 
 Datasets used:
-- Agents: SWE-Arena/pr_agents
+- Agents: SWE-Arena/swe_agents
 - PR metadata: SWE-Arena/pr_metadata
 - Leaderboard: SWE-Arena/pr_leaderboard
 
@@ -67,7 +67,7 @@ else:
 DEBUG_LEADERBOARD_CACHE = {}
 DEBUG_PR_METADATA_CACHE = defaultdict(list)
 
-AGENTS_REPO = "SWE-Arena/pr_agents"
+AGENTS_REPO = "SWE-Arena/swe_agents"
 LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
 
