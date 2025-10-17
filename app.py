@@ -47,7 +47,7 @@ else:
 DEBUG_LEADERBOARD_CACHE = {}
 DEBUG_PR_METADATA_CACHE = defaultdict(list)
 
-AGENTS_REPO = "SWE-Arena/pr_agents"  # HuggingFace dataset for agent metadata
+AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 LEADERBOARD_REPO = "SWE-Arena/pr_leaderboard"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"  # HuggingFace dataset for PR metadata
 
