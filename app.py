@@ -48,6 +48,7 @@ DEBUG_PR_METADATA_CACHE = defaultdict(list)
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"  # HuggingFace dataset for PR metadata
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for leaderboard (past 6 months)
 
 LEADERBOARD_COLUMNS = [
     ("Agent Name", "string"),
@@ -464,7 +465,7 @@ def extract_pr_metadata(pr):
     }
 
 
-def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, year=None, exclude_dates=None):
+def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, reviewexclude_dates=None):
     """
     Fetch pull requests associated with a GitHub user or bot for the past 6 months.
     Returns lightweight metadata instead of full PR objects.
@@ -480,7 +481,6 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
         agent_name: Human-readable name of the agent for metadata purposes
         token: GitHub API token for authentication
         start_from_date: Only fetch PRs created after this date (for incremental updates)
-        year: Year parameter (deprecated, retained for compatibility but not utilized)
         exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
 
     Returns:
@@ -628,7 +628,7 @@ def calculate_pr_stats_from_metadata(metadata_list):
 def calculate_monthly_metrics_by_agent():
     """
     Calculate monthly metrics for all agents for visualization.
-    Loads data directly from SWE-Arena/pr_metadata dataset for the current year.
+    Loads data directly from SWE-Arena/pr_metadata dataset.
 
     Returns:
         dict: {
@@ -644,17 +644,14 @@ def calculate_monthly_metrics_by_agent():
             }
         }
     """
-    # Get current year for loading metadata
-    current_year = datetime.now().year
-    
     # Load ALL agents from HuggingFace agents repo
     agents = load_agents_from_hf()
 
     # Create mapping from agent_identifier to agent_name
     identifier_to_name = {agent.get('github_identifier'): agent.get('agent_name') for agent in agents if agent.get('github_identifier')}
 
-    # Load all PR metadata for current year from pr_metadata dataset
-    all_metadata = load_pr_metadata_for_year(current_year)
+    # Load all PR metadata from pr_metadata dataset
+    all_metadata = load_pr_metadata()
 
     if not all_metadata:
         return {'agents': [], 'months': [], 'data': {}}
@@ -844,52 +841,78 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
         return False
 
 
-def load_pr_metadata_for_year(year):
+def load_pr_metadata():
     """
-    Load all PR metadata for a specific year from HuggingFace.
-    Scans all agent folders and loads daily files matching the year.
+    Loads PR metadata from the last LEADERBOARD_TIME_FRAME_DAYS only.
     In debug mode, loads from in-memory cache if available.
 
     Structure: [agent_identifier]/YYYY.MM.DD.jsonl
 
     Returns:
         List of dictionaries with 'agent_identifier' added to each PR metadata.
+        Only includes PRs within the last LEADERBOARD_TIME_FRAME_DAYS.
     """
     # In debug mode, check in-memory cache first
     if DEBUG_MODE and DEBUG_PR_METADATA_CACHE:
         all_metadata = []
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
         for agent_identifier, metadata_list in DEBUG_PR_METADATA_CACHE.items():
             for pr_meta in metadata_list:
-                pr_with_agent = pr_meta.copy()
-                pr_with_agent['agent_identifier'] = agent_identifier
-                all_metadata.append(pr_with_agent)
+                # Filter by created_at date
+                created_at = pr_meta.get('created_at')
+                if created_at:
+                    try:
+                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        if dt >= cutoff_date:
+                            pr_with_agent = pr_meta.copy()
+                            pr_with_agent['agent_identifier'] = agent_identifier
+                            all_metadata.append(pr_with_agent)
+                    except Exception:
+                        # If date parsing fails, skip this PR
+                        continue
+
         if all_metadata:
-            print(f"🐛 DEBUG MODE: Loading PR metadata from in-memory cache ({len(all_metadata)} PRs)")
+            print(f"🐛 DEBUG MODE: Loading PR metadata from in-memory cache ({len(all_metadata)} PRs from last {LEADERBOARD_TIME_FRAME_DAYS} days)")
             return all_metadata
 
     try:
         api = HfApi()
         token = get_hf_token()
 
+        # Calculate cutoff date for filtering
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
         # List all files in the repository
         files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
 
-        # Filter for files matching the year pattern: [agent_identifier]/YYYY.MM.DD.jsonl
-        # Extract year from filename
-        year_str = str(year)
-        year_files = []
+        # Filter for files within the time frame: [agent_identifier]/YYYY.MM.DD.jsonl
+        # Parse date from filename and only include files within LEADERBOARD_TIME_FRAME_DAYS
+        relevant_files = []
         for f in files:
             if f.endswith('.jsonl'):
                 parts = f.split('/')
                 if len(parts) == 2:  # [agent_identifier]/YYYY.MM.DD.jsonl
                     filename = parts[1]
-                    if filename.startswith(year_str + '.'):
-                        year_files.append(f)
+                    try:
+                        # Parse date from filename: YYYY.MM.DD.jsonl
+                        date_part = filename.replace('.jsonl', '')  # Get YYYY.MM.DD
+                        date_components = date_part.split('.')
+                        if len(date_components) == 3:
+                            file_year, file_month, file_day = map(int, date_components)
+                            file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
 
-        print(f"📥 Loading PR metadata for {year} ({len(year_files)} daily files across all agents)...")
+                            # Only include files within the time frame
+                            if file_date >= cutoff_date:
+                                relevant_files.append(f)
+                    except Exception:
+                        # If date parsing fails, skip this file
+                        continue
+
+        print(f"📥 Loading PR metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days ({len(relevant_files)} daily files across all agents)...")
 
         all_metadata = []
-        for filename in year_files:
+        for filename in relevant_files:
             try:
                 # Extract agent_identifier from path (first part)
                 # Format: agent_identifier/YYYY.MM.DD.jsonl
@@ -908,20 +931,31 @@ def load_pr_metadata_for_year(year):
                 )
                 day_metadata = load_jsonl(file_path)
 
-                # Add agent_identifier to each PR metadata for processing
+                # Filter individual PRs by created_at date as a double-check
                 for pr_meta in day_metadata:
-                    pr_meta['agent_identifier'] = agent_identifier
+                    created_at = pr_meta.get('created_at')
+                    if created_at:
+                        try:
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                            if dt >= cutoff_date:
+                                pr_meta['agent_identifier'] = agent_identifier
+                                all_metadata.append(pr_meta)
+                        except Exception:
+                            # If date parsing fails, skip this PR
+                            continue
+                    else:
+                        # If no created_at, skip this PR
+                        continue
 
-                all_metadata.extend(day_metadata)
-                print(f"   ✓ Loaded {len(day_metadata)} PRs from {filename}")
+                print(f"   ✓ Loaded PRs from {filename}")
             except Exception as e:
                 print(f"   Warning: Could not load {filename}: {str(e)}")
 
-        print(f"✓ Loaded {len(all_metadata)} total PRs for {year}")
+        print(f"✓ Loaded {len(all_metadata)} total PRs from last {LEADERBOARD_TIME_FRAME_DAYS} days")
         return all_metadata
 
     except Exception as e:
-        print(f"✗ Error loading PR metadata for {year}: {str(e)}")
+        print(f"✗ Error loading PR metadata from last {LEADERBOARD_TIME_FRAME_DAYS} days: {str(e)}")
         return []
 
 
@@ -1411,7 +1445,6 @@ def update_all_agents_incremental():
     Returns dictionary of all agent data with current stats.
     """
     token = get_github_token()
-    current_year = datetime.now().year
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -1466,12 +1499,12 @@ def update_all_agents_incremental():
             else:
                 print(f"   No new PRs to save")
 
-            # Load ALL metadata for current year to calculate stats (aggregates entire last 6 months)
+            # Load ALL metadata to calculate stats (aggregates entire last 6 months)
             print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_year_metadata = load_pr_metadata_for_year(current_year)
+            all_metadata = load_pr_metadata()
 
             # Filter for this specific agent
-            agent_metadata = [pr for pr in all_year_metadata if pr.get('agent_identifier') == identifier]
+            agent_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]
 
             # Calculate stats from metadata
             stats = calculate_pr_stats_from_metadata(agent_metadata)
@@ -1503,16 +1536,14 @@ def construct_leaderboard_from_metadata():
     Returns dictionary of agent stats.
     """
     print("📊 Constructing leaderboard from PR metadata...")
-    current_year = datetime.now().year
-
     # Load agents
     agents = load_agents_from_hf()
     if not agents:
         print("No agents found")
         return {}
 
-    # Load all PR metadata for current year
-    all_metadata = load_pr_metadata_for_year(current_year)
+    # Load all PR metadata
+    all_metadata = load_pr_metadata()
 
     cache_dict = {}
 
@@ -1546,8 +1577,6 @@ def initialize_data():
     - Does NOT save to HuggingFace datasets
     """
     print("🚀 Initializing leaderboard data...")
-
-    year = datetime.now().year
 
     # Try constructing from PR metadata in SWE-Arena/pr_metadata (fast, memory-efficient)
     print(f"Checking SWE-Arena/pr_metadata for existing data...")
