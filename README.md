@@ -1,6 +1,6 @@
 ---
 title: SWE-PR
-emoji: 👌
+emoji: ⚙️
 colorFrom: blue
 colorTo: green
 sdk: gradio
