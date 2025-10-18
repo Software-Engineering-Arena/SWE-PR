@@ -224,17 +224,54 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None):
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
+def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, debug_limit=None, depth=0):
+    """
+    Fetch PRs within a specific time range using time-based partitioning.
+    Recursively splits the time range if hitting the 1000-result limit.
+    Supports splitting by day, hour, minute, and second as needed.
+
+    Args:
+        debug_limit: If set, stops fetching after this many PRs (for testing)
+        depth: Current recursion depth (for tracking)
+
+    Returns the number of PRs found in this time partition.
+    """
+    # Calculate time difference
+    time_diff = end_date - start_date
+    total_seconds = time_diff.total_seconds()
+
+    # Determine granularity and format dates accordingly
+    if total_seconds >= 86400:  # >= 1 day
+        # Use day granularity (YYYY-MM-DD)
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+    elif total_seconds >= 3600:  # >= 1 hour but < 1 day
+        # Use hour granularity (YYYY-MM-DDTHH:MM:SSZ)
+        start_str = start_date.strftime('%Y-%m-%dT%H:00:00Z')
+        end_str = end_date.strftime('%Y-%m-%dT%H:59:59Z')
+    elif total_seconds >= 60:  # >= 1 minute but < 1 hour
+        # Use minute granularity (YYYY-MM-DDTHH:MM:SSZ)
+        start_str = start_date.strftime('%Y-%m-%dT%H:%M:00Z')
+        end_str = end_date.strftime('%Y-%m-%dT%H:%M:59Z')
+    else:  # < 1 minute
+        # Use second granularity (YYYY-MM-DDTHH:MM:SSZ)
+        start_str = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_str = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Add date range to query
     query = f'{base_query} created:{start_str}..{end_str}'
-    print(f"  Searching range {start_str} to {end_str}...")
+
+    indent = "  " + "  " * depth
+    print(f"{indent}Searching range {start_str} to {end_str}...")
+
     page = 1
     per_page = 100
     total_in_partition = 0
+
     while True:
+        # Check debug limit
         if debug_limit is not None and total_in_partition >= debug_limit:
-            print(f"    🐛 DEBUG MODE: Reached limit of {debug_limit} PRs, stopping...")
+            print(f"{indent}  🐛 DEBUG MODE: Reached limit of {debug_limit} PRs, stopping...")
             return total_in_partition
         url = 'https://api.github.com/search/issues'
         params = {
@@ -244,40 +281,161 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
             'sort': 'created',
             'order': 'asc'
         }
+
         try:
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
-                print(f"    Error: retries exhausted for range {start_str} to {end_str}")
+                print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
                 return total_in_partition
+
             if response.status_code != 200:
-                print(f"    Error: HTTP {response.status_code} for range {start_str} to {end_str}")
+                print(f"{indent}  Error: HTTP {response.status_code} for range {start_str} to {end_str}")
                 return total_in_partition
+
             data = response.json()
             total_count = data.get('total_count', 0)
             items = data.get('items', [])
+
             if not items:
                 break
+
+            # Add PRs to global dict
             for pr in items:
                 pr_id = pr.get('id')
                 if pr_id and pr_id not in prs_by_id:
                     prs_by_id[pr_id] = pr
                     total_in_partition += 1
+
+            # Check if we hit the 1000-result limit
             if total_count > 1000 and page == 10:
-                print(f"    ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
-                time_diff = end_date - start_date
-                mid_date = start_date + time_diff / 2
-                count1 = fetch_prs_with_time_partition(base_query, start_date, mid_date, headers, prs_by_id, debug_limit)
-                count2 = fetch_prs_with_time_partition(base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit)
-                return count1 + count2
+                print(f"{indent}  ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
+
+                # Determine how to split based on time range duration
+                if total_seconds < 2:  # Less than 2 seconds - can't split further
+                    print(f"{indent}  ⚠️ Cannot split further (range < 2 seconds). Some results may be missing.")
+                    break
+
+                elif total_seconds < 120:  # Less than 2 minutes - split by seconds
+                    # Split into 2-4 parts depending on range
+                    num_splits = min(4, max(2, int(total_seconds / 30)))
+                    split_duration = time_diff / num_splits
+                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
+
+                    total_from_splits = 0
+                    for i in range(num_splits):
+                        split_start = split_dates[i]
+                        split_end = split_dates[i + 1]
+                        # Avoid overlapping ranges (add 1 second to start)
+                        if i > 0:
+                            split_start = split_start + timedelta(seconds=1)
+
+                        count = fetch_prs_with_time_partition(
+                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                        )
+                        total_from_splits += count
+
+                    return total_from_splits
+
+                elif total_seconds < 7200:  # Less than 2 hours - split by minutes
+                    # Split into 2-4 parts
+                    num_splits = min(4, max(2, int(total_seconds / 1800)))
+                    split_duration = time_diff / num_splits
+                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
+
+                    total_from_splits = 0
+                    for i in range(num_splits):
+                        split_start = split_dates[i]
+                        split_end = split_dates[i + 1]
+                        # Avoid overlapping ranges (add 1 minute to start)
+                        if i > 0:
+                            split_start = split_start + timedelta(minutes=1)
+
+                        count = fetch_prs_with_time_partition(
+                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                        )
+                        total_from_splits += count
+
+                    return total_from_splits
+
+                elif total_seconds < 172800:  # Less than 2 days - split by hours
+                    # Split into 2-4 parts
+                    num_splits = min(4, max(2, int(total_seconds / 43200)))
+                    split_duration = time_diff / num_splits
+                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
+
+                    total_from_splits = 0
+                    for i in range(num_splits):
+                        split_start = split_dates[i]
+                        split_end = split_dates[i + 1]
+                        # Avoid overlapping ranges (add 1 hour to start)
+                        if i > 0:
+                            split_start = split_start + timedelta(hours=1)
+
+                        count = fetch_prs_with_time_partition(
+                            base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                        )
+                        total_from_splits += count
+
+                    return total_from_splits
+
+                else:  # 2+ days - split by days
+                    days_diff = time_diff.days
+
+                    # Use aggressive splitting for large ranges or deep recursion
+                    # Split into 4 parts if range is > 30 days, otherwise split in half
+                    if days_diff > 30 or depth > 5:
+                        # Split into 4 parts for more aggressive partitioning
+                        quarter_diff = time_diff / 4
+                        split_dates = [
+                            start_date,
+                            start_date + quarter_diff,
+                            start_date + quarter_diff * 2,
+                            start_date + quarter_diff * 3,
+                            end_date
+                        ]
+
+                        total_from_splits = 0
+                        for i in range(4):
+                            split_start = split_dates[i]
+                            split_end = split_dates[i + 1]
+                            # Avoid overlapping ranges
+                            if i > 0:
+                                split_start = split_start + timedelta(days=1)
+
+                            count = fetch_prs_with_time_partition(
+                                base_query, split_start, split_end, headers, prs_by_id, debug_limit, depth + 1
+                            )
+                            total_from_splits += count
+
+                        return total_from_splits
+                    else:
+                        # Binary split for smaller ranges
+                        mid_date = start_date + time_diff / 2
+
+                        # Recursively fetch both halves
+                        count1 = fetch_prs_with_time_partition(
+                            base_query, start_date, mid_date, headers, prs_by_id, debug_limit, depth + 1
+                        )
+                        count2 = fetch_prs_with_time_partition(
+                            base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, debug_limit, depth + 1
+                        )
+
+                        return count1 + count2
+
+            # Normal pagination: check if there are more pages
             if len(items) < per_page or page >= 10:
                 break
+
             page += 1
-            time.sleep(0.5)
+            time.sleep(0.5)  # Courtesy delay between pages
+
         except Exception as e:
-            print(f"    Error fetching range {start_str} to {end_str}: {str(e)}")
+            print(f"{indent}  Error fetching range {start_str} to {end_str}: {str(e)}")
             return total_in_partition
+
     if total_in_partition > 0:
-        print(f"    ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
+        print(f"{indent}  ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
+
     return total_in_partition
 
 
