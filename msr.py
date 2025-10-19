@@ -144,41 +144,52 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id, depth=0):
+def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, prs_by_id, depth=0, max_depth=8):
     """
-    Fetch PRs within a specific time range using time-based partitioning.
-    Recursively splits the time range if hitting the 1000-result limit.
-    Supports splitting by day, hour, minute, and second as needed.
+    Recursively fetch PRs within a time range by subdividing into smaller granularities.
+    This function handles INTRA-DAY partitioning (hours → minutes → seconds).
+    
+    Used when a single day query hits the 1000-result limit.
+    Recursion is bounded to prevent stack overflow.
 
-    Returns the number of PRs found in this time partition.
+    Args:
+        base_query: Base query string (already includes the day in created: clause)
+        start_date: Start datetime
+        end_date: End datetime
+        headers: HTTP headers with auth token
+        prs_by_id: Dict to store deduplicated PRs by ID
+        depth: Current recursion depth
+        max_depth: Maximum allowed recursion depth
+
+    Returns:
+        Total number of new PRs found in this partition
     """
-    # Calculate time difference
+    # Safety limit on recursion depth
+    if depth >= max_depth:
+        print(f"{'  ' * depth}⚠️  Max recursion depth ({max_depth}) reached. Some results may be missing.")
+        return 0
+
     time_diff = end_date - start_date
     total_seconds = time_diff.total_seconds()
 
-    # Determine granularity and format dates accordingly
-    if total_seconds >= 86400:  # >= 1 day
-        # Use day granularity (YYYY-MM-DD)
-        start_str = start_date.strftime('%Y-%m-%d')
-        end_str = end_date.strftime('%Y-%m-%d')
-    elif total_seconds >= 3600:  # >= 1 hour but < 1 day
-        # Use hour granularity (YYYY-MM-DDTHH:MM:SSZ)
+    # Determine granularity based on time range
+    if total_seconds >= 3600:  # >= 1 hour - subdivide by hours
         start_str = start_date.strftime('%Y-%m-%dT%H:00:00Z')
         end_str = end_date.strftime('%Y-%m-%dT%H:59:59Z')
-    elif total_seconds >= 60:  # >= 1 minute but < 1 hour
-        # Use minute granularity (YYYY-MM-DDTHH:MM:SSZ)
+        granularity = "hour"
+    elif total_seconds >= 60:  # >= 1 minute - subdivide by minutes
         start_str = start_date.strftime('%Y-%m-%dT%H:%M:00Z')
         end_str = end_date.strftime('%Y-%m-%dT%H:%M:59Z')
-    else:  # < 1 minute
-        # Use second granularity (YYYY-MM-DDTHH:MM:SSZ)
+        granularity = "minute"
+    else:  # < 1 minute - subdivide by seconds
         start_str = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
         end_str = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+        granularity = "second"
 
-    # Add date range to query
     query = f'{base_query} created:{start_str}..{end_str}'
+    indent = "  " * depth
 
-    indent = "  " + "  " * depth
-    print(f"{indent}Searching range {start_str} to {end_str}...")
+    print(f"{indent}[Depth {depth}] Searching {granularity} range: {start_str} to {end_str}...")
 
     page = 1
     per_page = 100
@@ -197,11 +208,11 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
         try:
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
-                print(f"{indent}  Error: retries exhausted for range {start_str} to {end_str}")
+                print(f"{indent}  ✗ Retries exhausted for {start_str} to {end_str}")
                 return total_in_partition
 
             if response.status_code != 200:
-                print(f"{indent}  Error: HTTP {response.status_code} for range {start_str} to {end_str}")
+                print(f"{indent}  ✗ HTTP {response.status_code} for {start_str} to {end_str}")
                 return total_in_partition
 
             data = response.json()
@@ -211,7 +222,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
             if not items:
                 break
 
-            # Add PRs to global dict
+            # Add PRs to global dict, count new ones
             for pr in items:
                 pr_id = pr.get('id')
                 if pr_id and pr_id not in prs_by_id:
@@ -220,119 +231,38 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
 
             # Check if we hit the 1000-result limit
             if total_count > 1000 and page == 10:
-                print(f"{indent}  ⚠️ Hit 1000-result limit ({total_count} total). Splitting time range...")
+                print(f"{indent}  ⚠️  Hit 1000-result limit ({total_count} total). Subdividing {granularity}...")
 
-                # Determine how to split based on time range duration
-                if total_seconds < 2:  # Less than 2 seconds - can't split further
-                    print(f"{indent}  ⚠️ Cannot split further (range < 2 seconds). Some results may be missing.")
+                # Check if we can subdivide further
+                if total_seconds < 2:
+                    print(f"{indent}  ⚠️  Cannot subdivide further (< 2 seconds). Some results may be missing.")
                     break
 
-                elif total_seconds < 120:  # Less than 2 minutes - split by seconds
-                    # Split into 2-4 parts depending on range
-                    num_splits = min(4, max(2, int(total_seconds / 30)))
-                    split_duration = time_diff / num_splits
-                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
+                # Subdivide based on current granularity
+                if granularity == "hour":
+                    # Split hour into 4 parts (15-minute intervals)
+                    num_splits = 4
+                elif granularity == "minute":
+                    # Split minute into 4 parts (15-second intervals)
+                    num_splits = 4
+                else:  # granularity == "second"
+                    # Can't subdivide seconds further meaningfully
+                    print(f"{indent}  ⚠️  Already at second granularity. Cannot subdivide. Some results may be missing.")
+                    break
 
-                    total_from_splits = 0
-                    for i in range(num_splits):
-                        split_start = split_dates[i]
-                        split_end = split_dates[i + 1]
-                        # Avoid overlapping ranges (add 1 second to start)
-                        if i > 0:
-                            split_start = split_start + timedelta(seconds=1)
+                split_duration = time_diff / num_splits
+                total_from_splits = 0
 
-                        count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, depth + 1
-                        )
-                        total_from_splits += count
+                for i in range(num_splits):
+                    split_start = start_date + split_duration * i
+                    split_end = start_date + split_duration * (i + 1)
 
-                    return total_from_splits
+                    count = fetch_prs_within_day_partition(
+                        base_query, split_start, split_end, headers, prs_by_id, depth + 1, max_depth
+                    )
+                    total_from_splits += count
 
-                elif total_seconds < 7200:  # Less than 2 hours - split by minutes
-                    # Split into 2-4 parts
-                    num_splits = min(4, max(2, int(total_seconds / 1800)))
-                    split_duration = time_diff / num_splits
-                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
-
-                    total_from_splits = 0
-                    for i in range(num_splits):
-                        split_start = split_dates[i]
-                        split_end = split_dates[i + 1]
-                        # Avoid overlapping ranges (add 1 minute to start)
-                        if i > 0:
-                            split_start = split_start + timedelta(minutes=1)
-
-                        count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, depth + 1
-                        )
-                        total_from_splits += count
-
-                    return total_from_splits
-
-                elif total_seconds < 172800:  # Less than 2 days - split by hours
-                    # Split into 2-4 parts
-                    num_splits = min(4, max(2, int(total_seconds / 43200)))
-                    split_duration = time_diff / num_splits
-                    split_dates = [start_date + split_duration * i for i in range(num_splits + 1)]
-
-                    total_from_splits = 0
-                    for i in range(num_splits):
-                        split_start = split_dates[i]
-                        split_end = split_dates[i + 1]
-                        # Avoid overlapping ranges (add 1 hour to start)
-                        if i > 0:
-                            split_start = split_start + timedelta(hours=1)
-
-                        count = fetch_prs_with_time_partition(
-                            base_query, split_start, split_end, headers, prs_by_id, depth + 1
-                        )
-                        total_from_splits += count
-
-                    return total_from_splits
-
-                else:  # 2+ days - split by days
-                    days_diff = time_diff.days
-
-                    # Use aggressive splitting for large ranges or deep recursion
-                    # Split into 4 parts if range is > 30 days, otherwise split in half
-                    if days_diff > 30 or depth > 5:
-                        # Split into 4 parts for more aggressive partitioning
-                        quarter_diff = time_diff / 4
-                        split_dates = [
-                            start_date,
-                            start_date + quarter_diff,
-                            start_date + quarter_diff * 2,
-                            start_date + quarter_diff * 3,
-                            end_date
-                        ]
-
-                        total_from_splits = 0
-                        for i in range(4):
-                            split_start = split_dates[i]
-                            split_end = split_dates[i + 1]
-                            # Avoid overlapping ranges
-                            if i > 0:
-                                split_start = split_start + timedelta(days=1)
-
-                            count = fetch_prs_with_time_partition(
-                                base_query, split_start, split_end, headers, prs_by_id, depth + 1
-                            )
-                            total_from_splits += count
-
-                        return total_from_splits
-                    else:
-                        # Binary split for smaller ranges
-                        mid_date = start_date + time_diff / 2
-
-                        # Recursively fetch both halves
-                        count1 = fetch_prs_with_time_partition(
-                            base_query, start_date, mid_date, headers, prs_by_id, depth + 1
-                        )
-                        count2 = fetch_prs_with_time_partition(
-                            base_query, mid_date + timedelta(days=1), end_date, headers, prs_by_id, depth + 1
-                        )
-
-                        return count1 + count2
+                return total_from_splits
 
             # Normal pagination: check if there are more pages
             if len(items) < per_page or page >= 10:
@@ -342,13 +272,124 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
             time.sleep(0.5)  # Courtesy delay between pages
 
         except Exception as e:
-            print(f"{indent}  Error fetching range {start_str} to {end_str}: {str(e)}")
+            print(f"{indent}  ✗ Error fetching {start_str} to {end_str}: {str(e)}")
             return total_in_partition
 
     if total_in_partition > 0:
-        print(f"{indent}  ✓ Found {total_in_partition} PRs in range {start_str} to {end_str}")
+        print(f"{indent}  ✓ Found {total_in_partition} PRs in {granularity} range")
 
     return total_in_partition
+
+
+def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id):
+    """
+    Iteratively fetch PRs by iterating through each day in the date range.
+    For each day, query with daily granularity.
+    If a single day hits the 1000-result limit, subdivide that day recursively (hours → minutes → seconds).
+
+    This hybrid iterative-recursive approach prevents deep recursion by:
+    - Using iteration for the outer loop (days)
+    - Using recursion only for intra-day partitioning (hours/minutes/seconds)
+
+    Args:
+        base_query: Base query string (e.g., 'is:pr author:{identifier}')
+        start_date: Start date
+        end_date: End date (inclusive)
+        headers: HTTP headers with auth token
+        prs_by_id: Dict to store deduplicated PRs by ID
+
+    Returns:
+        Total number of new PRs found
+    """
+    current_date = start_date
+    total_found = 0
+
+    # Iterate through each day
+    while current_date <= end_date:
+        day_start = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        # Ensure we don't go past end_date
+        if day_end > end_date:
+            day_end = end_date
+
+        day_str = current_date.strftime('%Y-%m-%d')
+        print(f"\n📅 Processing day: {day_str}")
+
+        # First, try a simple daily query
+        query = f'{base_query} created:{day_str}'
+        url = 'https://api.github.com/search/issues'
+        params = {
+            'q': query,
+            'per_page': 1,
+            'page': 1,
+            'sort': 'created',
+            'order': 'asc'
+        }
+
+        try:
+            response = request_with_backoff('GET', url, headers=headers, params=params)
+            if response and response.status_code == 200:
+                data = response.json()
+                total_count = data.get('total_count', 0)
+
+                if total_count > 1000:
+                    print(f"  ⚠️  Day has {total_count} PRs (exceeds 1000-result limit). Subdividing by time of day...")
+                    # Use recursive intra-day partitioning
+                    count = fetch_prs_within_day_partition(
+                        base_query, day_start, day_end, headers, prs_by_id, depth=0
+                    )
+                    total_found += count
+                else:
+                    # Normal case: fetch all PRs for this day
+                    print(f"  Fetching {total_count} PRs...")
+                    page = 1
+                    per_page = 100
+                    day_count = 0
+
+                    while True:
+                        params_page = {
+                            'q': query,
+                            'per_page': per_page,
+                            'page': page,
+                            'sort': 'created',
+                            'order': 'asc'
+                        }
+
+                        response = request_with_backoff('GET', url, headers=headers, params=params_page)
+                        if not response or response.status_code != 200:
+                            break
+
+                        items = response.json().get('items', [])
+                        if not items:
+                            break
+
+                        for pr in items:
+                            pr_id = pr.get('id')
+                            if pr_id and pr_id not in prs_by_id:
+                                prs_by_id[pr_id] = pr
+                                day_count += 1
+
+                        if len(items) < per_page:
+                            break
+
+                        page += 1
+                        time.sleep(0.5)
+
+                    if day_count > 0:
+                        print(f"  ✓ Found {day_count} new PRs for {day_str}")
+                    total_found += day_count
+
+            time.sleep(0.5)  # Courtesy delay between days
+
+        except Exception as e:
+            print(f"  ✗ Error processing {day_str}: {str(e)}")
+            continue
+
+        # Move to next day
+        current_date += timedelta(days=1)
+
+    return total_found
 
 
 def extract_pr_metadata(pr):
