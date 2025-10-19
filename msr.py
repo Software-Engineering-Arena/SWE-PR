@@ -451,14 +451,14 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None):
     # Use a dict to deduplicate PRs by ID
     prs_by_id = {}
 
-    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS
+    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS (excluding today)
     current_time = datetime.now(timezone.utc)
-    start_date = current_time - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
-    end_date = current_time
+    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)  # 12:00 AM today (UTC)
+    start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
     for query_pattern in query_patterns:
         print(f"\n🔍 Searching with query: {query_pattern}")
-        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (today excluded)")
 
         pattern_start_time = time.time()
         initial_count = len(prs_by_id)
