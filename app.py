@@ -465,27 +465,22 @@ def extract_pr_metadata(pr):
     }
 
 
-def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=None, reviewexclude_dates=None):
+def fetch_daily_prs_metadata(identifier, agent_name, token=None, target_date=None):
     """
-    Fetch pull requests associated with a GitHub user or bot for the past 6 months.
-    Returns lightweight metadata instead of full PR objects.
-
-    This function employs time-based partitioning to navigate GitHub's 1000-result limit per query.
-    It searches using multiple query patterns:
-    - is:pr author:{identifier} (PRs authored by the bot)
-    - is:pr "co-authored-by: {identifier}" (PRs with commits co-authored by the bot)
-    - is:pr head:{identifier}/ (PRs with branch names starting with the bot identifier)
+    Fetch pull requests for a specific date (used for daily incremental updates).
 
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
         token: GitHub API token for authentication
-        start_from_date: Only fetch PRs created after this date (for incremental updates)
-        exclude_dates: Set of date objects to exclude from mining (dates that have already been processed)
+        target_date: Date object for which to fetch PRs (defaults to yesterday)
 
     Returns:
-        List of dictionaries containing minimal PR metadata
+        List of dictionaries containing minimal PR metadata for that date
     """
+    if target_date is None:
+        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+
     headers = {'Authorization': f'token {token}'} if token else {}
 
     # Debug mode: limit PR retrieval for testing
@@ -508,27 +503,18 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     # Use a dict to deduplicate PRs by ID
     prs_by_id = {}
 
-    # Define time range: past 6 months only (or from start_from_date if specified)
-    current_time = datetime.now(timezone.utc)
-    six_months_ago = current_time - timedelta(days=180)  # ~6 months
-
-    if start_from_date:
-        # Use start_from_date but ensure it's not older than 6 months
-        start_date = max(start_from_date, six_months_ago)
-    else:
-        start_date = six_months_ago
-
-    # End date is current time
-    end_date = current_time
+    # Convert target_date to datetime for API queries
+    start_date = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    end_date = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
 
     for query_pattern in query_patterns:
         print(f"\n🔍 Searching with query: {query_pattern}")
-        print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        print(f"   Date: {target_date.strftime('%Y-%m-%d')}")
 
         pattern_start_time = time.time()
         initial_count = len(prs_by_id)
 
-        # Fetch with time partitioning
+        # Fetch with time partitioning (for single day)
         prs_found = fetch_prs_with_time_partition(
             query_pattern,
             start_date,
@@ -550,47 +536,18 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None, start_from_date=N
     # Convert to lightweight metadata
     all_prs = list(prs_by_id.values())
 
-    # Filter out PRs from excluded dates if specified
-    if exclude_dates:
-        filtered_prs = []
-        excluded_count = 0
-        for pr in all_prs:
-            created_at = pr.get('created_at')
-            if created_at:
-                try:
-                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    pr_date = dt.date()
-                    if pr_date not in exclude_dates:
-                        filtered_prs.append(pr)
-                    else:
-                        excluded_count += 1
-                except Exception:
-                    filtered_prs.append(pr)  # Keep PRs with unparseable dates
-            else:
-                filtered_prs.append(pr)  # Keep PRs without created_at
-
-        if excluded_count > 0:
-            print(f"   ⏭️ Skipped {excluded_count} PRs from already-mined dates")
-        all_prs = filtered_prs
-
     if DEBUG_MODE:
-        print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_prs)} unique PRs for {identifier}")
+        print(f"\n✅ COMPLETE (DEBUG MODE): Found {len(all_prs)} unique PRs for {identifier} on {target_date}")
         print(f"   Note: In production mode, this would fetch ALL PRs")
     else:
-        print(f"\n✅ COMPLETE: Found {len(all_prs)} unique PRs for {identifier}")
+        print(f"\n✅ COMPLETE: Found {len(all_prs)} unique PRs for {identifier} on {target_date}")
     print(f"📦 Extracting minimal metadata...")
 
     metadata_list = [extract_pr_metadata(pr) for pr in all_prs]
 
-    # Calculate memory savings
-    import sys
-    original_size = sys.getsizeof(str(all_prs))
-    metadata_size = sys.getsizeof(str(metadata_list))
-    savings_pct = ((original_size - metadata_size) / original_size * 100) if original_size > 0 else 0
-
-    print(f"💾 Memory efficiency: {original_size // 1024}KB → {metadata_size // 1024}KB (saved {savings_pct:.1f}%)")
-
     return metadata_list
+
+
 
 
 def calculate_pr_stats_from_metadata(metadata_list):
@@ -1073,59 +1030,6 @@ def get_daily_files_last_n_months(agent_identifier, n_months=6):
         return []
 
 
-def get_already_mined_dates(agent_identifier, n_months=6):
-    """
-    Get set of dates that have already been mined for an agent.
-
-    Args:
-        agent_identifier: GitHub identifier of the agent
-        n_months: Number of months to look back (default: 6)
-
-    Returns:
-        Set of date objects (datetime.date) that already have data files
-    """
-    try:
-        api = HfApi()
-
-        # Calculate date range
-        today = datetime.now(timezone.utc)
-        n_months_ago = today - timedelta(days=30 * n_months)
-
-        # List all files in the repository
-        files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
-
-        # Filter for files in this agent's folder
-        agent_pattern = f"{agent_identifier}/"
-        agent_files = [f for f in files if f.startswith(agent_pattern) and f.endswith('.jsonl')]
-
-        mined_dates = set()
-        for filename in agent_files:
-            try:
-                # Extract date from filename: [agent_identifier]/YYYY.MM.DD.jsonl
-                parts = filename.split('/')
-                if len(parts) != 2:
-                    continue
-
-                date_part = parts[1].replace('.jsonl', '')  # Get YYYY.MM.DD
-                date_components = date_part.split('.')
-                if len(date_components) != 3:
-                    continue
-
-                file_year, file_month, file_day = map(int, date_components)
-                file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc).date()
-
-                # Only include dates within the last n_months
-                if n_months_ago.date() <= file_date <= today.date():
-                    mined_dates.add(file_date)
-            except Exception as e:
-                print(f"   Warning: Could not parse date from filename {filename}: {e}")
-                continue
-
-        return mined_dates
-
-    except Exception as e:
-        print(f"   Warning: Could not get already-mined dates for {agent_identifier}: {str(e)}")
-        return set()
 
 
 def fetch_pr_current_status(pr_url, token):
@@ -1432,101 +1336,98 @@ def save_agent_to_hf(data):
 
 def update_all_agents_incremental():
     """
-    Memory-efficient incremental update of PR statistics for all agents.
+    Daily incremental update - refreshes open PRs and fetches new PRs for all agents.
 
     Strategy:
-    1. For each agent, load existing data from SWE-Arena/pr_metadata
-    2. Identify already-mined dates (based on filename: YYYY.MM.DD.jsonl)
-    3. Only fetch PRs from dates that haven't been mined yet (within last 6 months)
-    4. If no data exists at all, mine everything from scratch
-    5. Store minimal metadata (not full PR objects) to avoid storage limits
-    6. Construct leaderboard from ALL stored metadata (last 6 months)
-
-    Returns dictionary of all agent data with current stats.
+    1. Refresh status of all open PRs from the last LEADERBOARD_TIME_FRAME_DAYS - 1 days
+       (to check if any have been merged or closed)
+    2. Fetch new PRs created yesterday (from 12:00 AM to 11:59:59 PM yesterday)
+    3. Update the corresponding daily files (YYYY.MM.DD.jsonl)
+    4. This runs daily to keep data fresh without re-mining everything
     """
-    token = get_github_token()
+    print(f"\n{'='*80}")
+    print(f"🕛 Daily Incremental PR Mining started at {datetime.now(timezone.utc).isoformat()}")
+    print(f"{'='*80}")
 
-    # Load agent metadata from HuggingFace
-    agents = load_agents_from_hf()
-    if not agents:
-        print("No agents found in HuggingFace dataset")
-        return {}
+    try:
+        token = get_github_token()
 
-    cache_dict = {}
+        # Load agent metadata from HuggingFace
+        agents = load_agents_from_hf()
+        if not agents:
+            print("No agents found in HuggingFace dataset")
+            return
 
-    # Update each agent
-    for agent in agents:
-        identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        # Calculate yesterday's date
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        print(f"\n📅 Daily Incremental Update for {yesterday.strftime('%Y-%m-%d')} for all agents...")
 
-        if not identifier:
-            print(f"Warning: Skipping agent without identifier: {agent}")
-            continue
+        agents_processed = 0
+        total_refreshed = 0
+        total_refreshed_updated = 0
+        total_new_prs = 0
 
-        try:
-            print(f"\n{'='*80}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*80}")
+        # Update each agent
+        for agent in agents:
+            identifier = agent.get('github_identifier')
+            agent_name = agent.get('agent_name', 'Unknown')
 
-            # Get already-mined dates for this agent (last 6 months)
-            already_mined_dates = get_already_mined_dates(identifier, n_months=6)
+            if not identifier:
+                print(f"Warning: Skipping agent without identifier: {agent}")
+                continue
 
-            if already_mined_dates:
-                print(f"📅 Found {len(already_mined_dates)} already-mined dates")
-                print(f"   Re-mining ALL dates (including existing) to update metadata...")
-                # Re-mine ALL PRs (do NOT exclude already-mined dates)
-                # This ensures metadata like merged_at is updated even if day file exists
-                new_metadata = fetch_all_prs_metadata(
+            try:
+                print(f"\n{'='*80}")
+                print(f"Processing: {agent_name} ({identifier})")
+                print(f"{'='*80}")
+
+                # STEP 1: Refresh all open PRs from the last LEADERBOARD_TIME_FRAME_DAYS - 1 days
+                print(f"\n🔄 Step 1: Refreshing open PRs (last {LEADERBOARD_TIME_FRAME_DAYS - 1} days)...")
+                refreshed_checked, refreshed_updated = refresh_open_prs_for_agent(
+                    identifier,
+                    token
+                )
+                total_refreshed += refreshed_checked
+                total_refreshed_updated += refreshed_updated
+
+                # STEP 2: Fetch new PRs created yesterday (12:00 AM to 11:59:59 PM yesterday)
+                print(f"\n📥 Step 2: Fetching new PRs created on {yesterday.strftime('%Y-%m-%d')} (12:00 AM to 11:59:59 PM)...")
+                new_metadata = fetch_daily_prs_metadata(
                     identifier,
                     agent_name,
                     token,
-                    start_from_date=None,  # Use full 6-month range
-                    exclude_dates=None  # Re-mine ALL dates (no exclusions)
-                )
-            else:
-                print(f"📅 No existing data found. Mining everything from scratch...")
-                # Mine everything from scratch (full 6-month range)
-                new_metadata = fetch_all_prs_metadata(
-                    identifier,
-                    agent_name,
-                    token,
-                    start_from_date=None
+                    target_date=yesterday
                 )
 
-            if new_metadata:
-                # Save new metadata to HuggingFace (organized by agent_identifier/YYYY.MM.DD.jsonl)
-                print(f"💾 Saving {len(new_metadata)} new PR records...")
-                save_pr_metadata_to_hf(new_metadata, identifier)
-            else:
-                print(f"   No new PRs to save")
+                if new_metadata:
+                    # Save new metadata to HuggingFace
+                    print(f"💾 Saving {len(new_metadata)} new PRs from {yesterday}...")
+                    save_pr_metadata_to_hf(new_metadata, identifier)
+                    total_new_prs += len(new_metadata)
+                else:
+                    print(f"   No new PRs found created on {yesterday}")
 
-            # Load ALL metadata to calculate stats (aggregates entire last 6 months)
-            print(f"📊 Calculating statistics from ALL stored metadata (last 6 months)...")
-            all_metadata = load_pr_metadata()
+                agents_processed += 1
 
-            # Filter for this specific agent
-            agent_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]
+            except Exception as e:
+                print(f"✗ Error updating {identifier}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
 
-            # Calculate stats from metadata
-            stats = calculate_pr_stats_from_metadata(agent_metadata)
+        print(f"\n{'='*80}")
+        print(f"📊 Mining Summary:")
+        print(f"   Total agents processed: {agents_processed}")
+        print(f"   Open PRs refreshed: {total_refreshed} checked, {total_refreshed_updated} updated")
+        print(f"   New PRs added (from yesterday): {total_new_prs}")
+        print(f"{'='*80}")
 
-            # Merge metadata with stats
-            cache_dict[identifier] = {
-                'agent_name': agent_name,
-                'website': agent.get('website', 'Unknown'),
-                'github_identifier': identifier,
-                **stats
-            }
+        print(f"\n✅ Daily Incremental PR Mining completed at {datetime.now(timezone.utc).isoformat()}")
 
-            print(f"✓ Updated {identifier}: {stats['total_prs']} PRs, {stats['acceptance_rate']}% acceptance")
-
-        except Exception as e:
-            print(f"✗ Error updating {identifier}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    return cache_dict
+    except Exception as e:
+        print(f"✗ Daily mining failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 def construct_leaderboard_from_metadata():
@@ -1566,58 +1467,6 @@ def construct_leaderboard_from_metadata():
         }
 
     return cache_dict
-
-
-def initialize_data():
-    """
-    Initialize data on application startup.
-    Constructs leaderboard from PR metadata only.
-
-    In DEBUG MODE:
-    - If no data available, automatically mine up to 10 PRs per query per agent
-    - Does NOT save to HuggingFace datasets
-    """
-    print("🚀 Initializing leaderboard data...")
-
-    # Try constructing from PR metadata in SWE-Arena/pr_metadata (fast, memory-efficient)
-    print(f"Checking SWE-Arena/pr_metadata for existing data...")
-    try:
-        cache_dict = construct_leaderboard_from_metadata()
-        # Check if there's actually meaningful data (at least one agent with PRs)
-        has_data = any(entry.get('total_prs', 0) > 0 for entry in cache_dict.values())
-        if cache_dict and has_data:
-            print(f"✓ Found PR metadata in pr_metadata repository")
-            print("✓ Initialized from PR metadata")
-            return
-        else:
-            print("   No meaningful PR metadata found in pr_metadata repository")
-    except Exception as e:
-        print(f"   Could not construct from metadata: {e}")
-
-    # If in debug mode and no data available, mine immediately
-    if DEBUG_MODE:
-        print("\n🐛 DEBUG MODE: No data available, mining immediately (up to 10 PRs per query per agent)...")
-        agents = load_agents_from_hf()
-        if agents:
-            print(f"✓ Loaded {len(agents)} agents from HuggingFace")
-            print("⛏️ Mining GitHub data in debug mode (limited to 10 PRs per query)...")
-            cache_dict = update_all_agents_incremental()
-            print("✓ Debug mining complete (data NOT saved to HuggingFace)")
-            return
-        else:
-            print("⚠️ No agents found. Waiting for first submission...")
-            return
-
-    # Production mode: Fallback to full incremental mining from GitHub
-    agents = load_agents_from_hf()
-    if agents:
-        print(f"✓ Loaded {len(agents)} agents from HuggingFace")
-        print("⛏️ Mining GitHub data (this may take a while)...")
-        cache_dict = update_all_agents_incremental()
-        return
-
-    # No data available
-    print("⚠️ No data sources available. Waiting for first submission...")
 
 
 # =============================================================================
@@ -1792,7 +1641,8 @@ def get_leaderboard_dataframe():
 def submit_agent(identifier, agent_name, organization, description, website):
     """
     Submit a new agent to the leaderboard.
-    Validates input, saves submission, and fetches PR metadata (memory-efficient).
+    Validates input and saves submission.
+    PR data will be populated by the daily incremental update.
     """
     # Validate required fields
     if not identifier or not identifier.strip():
@@ -1836,64 +1686,8 @@ def submit_agent(identifier, agent_name, organization, description, website):
     if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
-    # Fetch PR metadata immediately (memory-efficient)
-    token = get_github_token()
-    try:
-        print(f"Fetching PR metadata for {agent_name}...")
-
-        # Fetch lightweight metadata
-        metadata_list = fetch_all_prs_metadata(identifier, agent_name, token)
-
-        if metadata_list:
-            # Save metadata to HuggingFace
-            save_pr_metadata_to_hf(metadata_list, identifier)
-
-        return f"✅ Successfully submitted {agent_name}!", get_leaderboard_dataframe(), create_monthly_metrics_plot()
-
-    except Exception as e:
-        error_msg = f"⚠️ Submitted {agent_name}, but failed to fetch PR data: {str(e)}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg, get_leaderboard_dataframe(), create_monthly_metrics_plot()
-
-
-# =============================================================================
-# BACKGROUND TASKS
-# =============================================================================
-
-def daily_update_task():
-    """
-    Daily scheduled task (runs at 12:00 AM UTC) for regular PR mining.
-
-    Strategy:
-    1. Re-mine ALL PRs for all agents within the last 6 months (LEADERBOARD_TIME_FRAME_DAYS)
-    2. Update ALL day files, even if they already exist
-    3. This ensures metadata like 'merged_at' is always current (e.g., PRs merged after initial mining)
-
-    This replaces the old refresh_open_prs approach to ensure no stale data.
-    """
-    print(f"\n{'='*80}")
-    print(f"🕛 Daily Regular PR Mining started at {datetime.now(timezone.utc).isoformat()}")
-    print(f"{'='*80}")
-
-    try:
-        # Re-mine all PRs for all agents (will update existing day files)
-        print(f"📋 Re-mining all PRs within {LEADERBOARD_TIME_FRAME_DAYS} days for all agents...")
-        cache_dict = update_all_agents_incremental()
-
-        print(f"\n{'='*80}")
-        print(f"📊 Mining Summary:")
-        print(f"   Total agents processed: {len(cache_dict)}")
-        print(f"   All PR metadata updated (including existing day files)")
-        print(f"{'='*80}")
-
-        print(f"\n✅ Daily Regular PR Mining completed at {datetime.now(timezone.utc).isoformat()}")
-
-    except Exception as e:
-        print(f"✗ Daily mining failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    success_msg = f"✅ Successfully submitted {agent_name}!\n\nPR data will be populated by the daily incremental update (runs at 12:00 AM UTC)."
+    return success_msg, get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
 
 # =============================================================================
@@ -1922,19 +1716,17 @@ else:
         print("   (Explicitly set via '--no-debug' flag)")
     print()
 
-initialize_data()
-
-# Start APScheduler for daily regular PR mining at 12:00 AM UTC
+# Start APScheduler for daily incremental PR mining at 12:00 AM UTC
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
-    daily_update_task,
+    update_all_agents_incremental,
     trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM UTC daily
-    id='daily_regular_pr_mining',
-    name='Daily Regular PR Mining',
+    id='daily_incremental_pr_mining',
+    name='Daily Incremental PR Mining',
     replace_existing=True
 )
 scheduler.start()
-print("✓ Scheduler started: Daily Regular PR Mining at 12:00 AM UTC")
+print("✓ Scheduler started: Daily Incremental PR Mining at 12:00 AM UTC")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
