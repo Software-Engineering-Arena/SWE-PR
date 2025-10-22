@@ -757,11 +757,15 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
     In debug mode, saves to in-memory cache only.
 
     This function APPENDS new metadata and DEDUPLICATES by html_url.
+    Uses batch upload to avoid HuggingFace rate limits (256 commits/hour).
 
     Args:
         metadata_list: List of PR metadata dictionaries
         agent_identifier: GitHub identifier of the agent (used as folder name)
     """
+    import tempfile
+    import shutil
+
     # Skip saving to HF in debug mode - use in-memory cache instead
     if DEBUG_MODE:
         global DEBUG_PR_METADATA_CACHE
@@ -783,52 +787,61 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
         # Group by exact date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
 
-        for (pr_year, month, day), day_metadata in grouped.items():
-            # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
-            filename = f"{agent_identifier}/{pr_year}.{month:02d}.{day:02d}.jsonl"
-            local_filename = f"{pr_year}.{month:02d}.{day:02d}.jsonl"
-            print(f"📤 Uploading {len(day_metadata)} PRs to {filename}...")
+        # Create a temporary directory to prepare all files for batch upload
+        temp_dir = tempfile.mkdtemp()
+        agent_dir = os.path.join(temp_dir, agent_identifier)
+        os.makedirs(agent_dir, exist_ok=True)
 
-            # Download existing file if it exists
-            existing_metadata = []
-            try:
-                file_path = hf_hub_download(
-                    repo_id=PR_METADATA_REPO,
-                    filename=filename,
-                    repo_type="dataset",
-                    token=token
-                )
-                existing_metadata = load_jsonl(file_path)
-                print(f"   Found {len(existing_metadata)} existing PRs in {filename}")
-            except Exception:
-                print(f"   No existing file found for {filename}, creating new")
+        try:
+            print(f"📦 Preparing {len(grouped)} daily files for batch upload...")
 
-            # Merge and deduplicate by html_url
-            existing_by_url = {meta['html_url']: meta for meta in existing_metadata if meta.get('html_url')}
-            new_by_url = {meta['html_url']: meta for meta in day_metadata if meta.get('html_url')}
+            for (pr_year, month, day), day_metadata in grouped.items():
+                # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
+                filename = f"{agent_identifier}/{pr_year}.{month:02d}.{day:02d}.jsonl"
+                local_path = os.path.join(agent_dir, f"{pr_year}.{month:02d}.{day:02d}.jsonl")
 
-            # Update with new data (new data overwrites old)
-            existing_by_url.update(new_by_url)
-            merged_metadata = list(existing_by_url.values())
+                print(f"   Preparing {len(day_metadata)} PRs for {filename}...")
 
-            # Save locally
-            save_jsonl(local_filename, merged_metadata)
+                # Download existing file if it exists
+                existing_metadata = []
+                try:
+                    file_path = hf_hub_download(
+                        repo_id=PR_METADATA_REPO,
+                        filename=filename,
+                        repo_type="dataset",
+                        token=token
+                    )
+                    existing_metadata = load_jsonl(file_path)
+                    print(f"      Found {len(existing_metadata)} existing PRs, merging...")
+                except Exception:
+                    print(f"      No existing file found, creating new...")
 
-            try:
-                # Upload to HuggingFace with folder path
-                upload_with_retry(
-                    api=api,
-                    path_or_fileobj=local_filename,
-                    path_in_repo=filename,
-                    repo_id=PR_METADATA_REPO,
-                    repo_type="dataset",
-                    token=token
-                )
-                print(f"   ✓ Saved {len(merged_metadata)} total PRs to {filename}")
-            finally:
-                # Always clean up local file, even if upload fails
-                if os.path.exists(local_filename):
-                    os.remove(local_filename)
+                # Merge and deduplicate by html_url
+                existing_by_url = {meta['html_url']: meta for meta in existing_metadata if meta.get('html_url')}
+                new_by_url = {meta['html_url']: meta for meta in day_metadata if meta.get('html_url')}
+
+                # Update with new data (new data overwrites old)
+                existing_by_url.update(new_by_url)
+                merged_metadata = list(existing_by_url.values())
+
+                # Save to temp directory
+                save_jsonl(local_path, merged_metadata)
+                print(f"      ✓ Prepared {len(merged_metadata)} total PRs")
+
+            # Batch upload entire folder in a single commit
+            print(f"\n📤 Uploading all files for {agent_identifier} in one batch...")
+            api.upload_folder(
+                folder_path=temp_dir,
+                repo_id=PR_METADATA_REPO,
+                repo_type="dataset",
+                token=token,
+                commit_message=f"Update PR metadata for {agent_identifier}"
+            )
+            print(f"   ✓ Successfully uploaded {len(grouped)} files in 1 commit")
+
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         return True
 
