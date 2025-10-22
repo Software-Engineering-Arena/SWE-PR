@@ -52,12 +52,51 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
+def get_github_tokens():
+    """Get all GitHub tokens from environment variables (all vars starting with GITHUB_TOKEN)."""
+    tokens = []
+    for key, value in os.environ.items():
+        if key.startswith('GITHUB_TOKEN') and value:
+            tokens.append(value)
+
+    if not tokens:
+        print("Warning: No GITHUB_TOKEN* found. API rate limits: 60/hour (authenticated: 5000/hour)")
+    else:
+        print(f"✓ Loaded {len(tokens)} GitHub token(s) for token pool")
+
+    return tokens
+
+
 def get_github_token():
-    """Get GitHub token from environment variables."""
+    """Get primary GitHub token from environment variables (for backward compatibility)."""
     token = os.getenv('GITHUB_TOKEN')
     if not token:
         print("Warning: GITHUB_TOKEN not found. API rate limits: 60/hour (authenticated: 5000/hour)")
     return token
+
+
+class TokenPool:
+    """
+    Manages a pool of GitHub tokens for load balancing across rate limits.
+    Rotates through tokens in round-robin fashion to distribute API calls.
+    """
+    def __init__(self, tokens):
+        self.tokens = tokens if tokens else [None]
+        self.current_index = 0
+        print(f"🔄 Token pool initialized with {len(self.tokens)} token(s)")
+
+    def get_next_token(self):
+        """Get the next token in round-robin order."""
+        if not self.tokens:
+            return None
+        token = self.tokens[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.tokens)
+        return token
+
+    def get_headers(self):
+        """Get headers with the next token in rotation."""
+        token = self.get_next_token()
+        return {'Authorization': f'token {token}'} if token else {}
 
 
 def get_hf_token():
@@ -144,7 +183,7 @@ def request_with_backoff(method, url, *, headers=None, params=None, json_body=No
     return None
 
 
-def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, prs_by_id, depth=0, max_depth=8):
+def fetch_prs_within_day_partition(base_query, start_date, end_date, token_pool, prs_by_id, depth=0, max_depth=8):
     """
     Recursively fetch PRs within a time range by subdividing into smaller granularities.
     This function handles INTRA-DAY partitioning (hours → minutes → seconds).
@@ -156,7 +195,7 @@ def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, pr
         base_query: Base query string (already includes the day in created: clause)
         start_date: Start datetime
         end_date: End datetime
-        headers: HTTP headers with auth token
+        token_pool: TokenPool instance for rotating tokens
         prs_by_id: Dict to store deduplicated PRs by ID
         depth: Current recursion depth
         max_depth: Maximum allowed recursion depth
@@ -206,6 +245,7 @@ def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, pr
         }
 
         try:
+            headers = token_pool.get_headers()
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response is None:
                 print(f"{indent}  ✗ Retries exhausted for {start_str} to {end_str}")
@@ -258,7 +298,7 @@ def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, pr
                     split_end = start_date + split_duration * (i + 1)
 
                     count = fetch_prs_within_day_partition(
-                        base_query, split_start, split_end, headers, prs_by_id, depth + 1, max_depth
+                        base_query, split_start, split_end, token_pool, prs_by_id, depth + 1, max_depth
                     )
                     total_from_splits += count
 
@@ -281,7 +321,7 @@ def fetch_prs_within_day_partition(base_query, start_date, end_date, headers, pr
     return total_in_partition
 
 
-def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs_by_id):
+def fetch_prs_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_id):
     """
     Iteratively fetch PRs by iterating through each day in the date range.
     For each day, query with daily granularity.
@@ -295,7 +335,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
         base_query: Base query string (e.g., 'is:pr author:{identifier}')
         start_date: Start date
         end_date: End date (inclusive)
-        headers: HTTP headers with auth token
+        token_pool: TokenPool instance for rotating tokens
         prs_by_id: Dict to store deduplicated PRs by ID
 
     Returns:
@@ -328,6 +368,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
         }
 
         try:
+            headers = token_pool.get_headers()
             response = request_with_backoff('GET', url, headers=headers, params=params)
             if response and response.status_code == 200:
                 data = response.json()
@@ -337,7 +378,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                     print(f"  ⚠️  Day has {total_count} PRs (exceeds 1000-result limit). Subdividing by time of day...")
                     # Use recursive intra-day partitioning
                     count = fetch_prs_within_day_partition(
-                        base_query, day_start, day_end, headers, prs_by_id, depth=0
+                        base_query, day_start, day_end, token_pool, prs_by_id, depth=0
                     )
                     total_found += count
                 else:
@@ -356,6 +397,7 @@ def fetch_prs_with_time_partition(base_query, start_date, end_date, headers, prs
                             'order': 'asc'
                         }
 
+                        headers = token_pool.get_headers()
                         response = request_with_backoff('GET', url, headers=headers, params=params_page)
                         if not response or response.status_code != 200:
                             break
@@ -416,7 +458,7 @@ def extract_pr_metadata(pr):
     }
 
 
-def fetch_all_prs_metadata(identifier, agent_name, token=None):
+def fetch_all_prs_metadata(identifier, agent_name, token_pool=None):
     """
     Fetch pull requests associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
     Returns lightweight metadata instead of full PR objects.
@@ -430,12 +472,11 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None):
     Args:
         identifier: GitHub username or bot identifier
         agent_name: Human-readable name of the agent for metadata purposes
-        token: GitHub API token for authentication
+        token_pool: TokenPool instance for rotating tokens
 
     Returns:
         List of dictionaries containing minimal PR metadata
     """
-    headers = {'Authorization': f'token {token}'} if token else {}
 
     # Define query patterns per rules:
     # 1) author pattern only if identifier contains "[bot]"
@@ -468,7 +509,7 @@ def fetch_all_prs_metadata(identifier, agent_name, token=None):
             query_pattern,
             start_date,
             end_date,
-            headers,
+            token_pool,
             prs_by_id
         )
 
@@ -678,7 +719,9 @@ def mine_all_agents():
     """
     Mine PR metadata for all agents within LEADERBOARD_TIME_FRAME_DAYS and save to HuggingFace.
     """
-    token = get_github_token()
+    # Initialize token pool
+    tokens = get_github_tokens()
+    token_pool = TokenPool(tokens)
 
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -706,7 +749,7 @@ def mine_all_agents():
             print(f"{'='*80}")
 
             # Fetch PR metadata
-            metadata = fetch_all_prs_metadata(identifier, agent_name, token)
+            metadata = fetch_all_prs_metadata(identifier, agent_name, token_pool)
 
             if metadata:
                 print(f"💾 Saving {len(metadata)} PR records...")
