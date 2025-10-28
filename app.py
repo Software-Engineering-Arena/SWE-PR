@@ -1867,7 +1867,6 @@ def create_monthly_metrics_plot():
                     legendgroup=agent_name,
                     showlegend=True,
                     hovertemplate='<b>%{fullData.name}</b><br>' +
-                                 'Month: %{x}<br>' +
                                  'Acceptance Rate: %{y:.2f}%<br>' +
                                  '<extra></extra>'
                 ),
@@ -1893,7 +1892,6 @@ def create_monthly_metrics_plot():
                     legendgroup=agent_name,
                     showlegend=False,  # Don't show in legend (already shown for line)
                     hovertemplate='<b>%{fullData.name}</b><br>' +
-                                 'Month: %{x}<br>' +
                                  'Total PRs: %{y}<br>' +
                                  '<extra></extra>',
                     offsetgroup=agent_name  # Group bars by agent for proper spacing
