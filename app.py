@@ -1907,7 +1907,7 @@ def create_monthly_metrics_plot():
     # Update layout
     fig.update_layout(
         title=None,
-        hovermode='x unified',
+        hovermode='closest',
         barmode='group',
         height=600,
         legend=dict(
