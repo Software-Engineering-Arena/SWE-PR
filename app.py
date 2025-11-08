@@ -892,6 +892,78 @@ def save_agent_to_hf(data):
         return False
 
 
+def save_leaderboard_and_metrics_to_hf():
+    """
+    Save leaderboard data and monthly metrics to SWE-Arena/leaderboard_metadata dataset.
+    Creates a comprehensive JSON file with both leaderboard stats and monthly metrics.
+    If the file exists, it will be overwritten.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    import io
+
+    try:
+        token = get_hf_token()
+        if not token:
+            raise Exception("No HuggingFace token found")
+
+        api = HfApi(token=token)
+
+        print(f"\n{'='*80}")
+        print(f"📊 Preparing leaderboard and metrics data for upload...")
+        print(f"{'='*80}\n")
+
+        # Get leaderboard data
+        print("   Constructing leaderboard data...")
+        leaderboard_data = construct_leaderboard_from_metadata()
+
+        # Get monthly metrics data (all agents, not just top N)
+        print("   Calculating monthly metrics...")
+        monthly_metrics = calculate_monthly_metrics_by_agent(top_n=None)
+
+        # Combine into a single structure
+        combined_data = {
+            "leaderboard": leaderboard_data,
+            "monthly_metrics": monthly_metrics,
+            "metadata": {
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "time_frame_days": LEADERBOARD_TIME_FRAME_DAYS,
+                "total_agents": len(leaderboard_data)
+            }
+        }
+
+        print(f"   Leaderboard entries: {len(leaderboard_data)}")
+        print(f"   Monthly metrics for: {len(monthly_metrics['agents'])} agents")
+        print(f"   Time frame: {LEADERBOARD_TIME_FRAME_DAYS} days")
+
+        # Convert to JSON and create file-like object
+        json_content = json.dumps(combined_data, indent=2)
+        file_like_object = io.BytesIO(json_content.encode('utf-8'))
+
+        # Upload to HuggingFace (will overwrite if exists)
+        print(f"\n🤗 Uploading to {LEADERBOARD_REPO}...")
+        api.upload_file(
+            path_or_fileobj=file_like_object,
+            path_in_repo="swe-pr.json",
+            repo_id=LEADERBOARD_REPO,
+            repo_type="dataset",
+            token=token,
+            commit_message=f"Update leaderboard data - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+
+        print(f"   ✓ Successfully uploaded swe-pr.json")
+        print(f"{'='*80}\n")
+
+        return True
+
+    except Exception as e:
+        print(f"   ✗ Error saving leaderboard data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 # =============================================================================
 # DATA MANAGEMENT
 # =============================================================================
@@ -991,6 +1063,13 @@ def mine_all_agents():
     print(f"   Errors: {error_count}")
     print(f"   BigQuery queries executed: 1")
     print(f"{'='*80}\n")
+
+    # After mining is complete, save leaderboard and metrics to HuggingFace
+    print(f"📤 Uploading leaderboard and metrics data...")
+    if save_leaderboard_and_metrics_to_hf():
+        print(f"✓ Leaderboard and metrics successfully uploaded to {LEADERBOARD_REPO}")
+    else:
+        print(f"⚠️ Failed to upload leaderboard and metrics data")
 
 
 def construct_leaderboard_from_metadata():
