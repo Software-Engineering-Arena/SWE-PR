@@ -159,10 +159,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     """
     Fetch PR metadata for ALL agents using ONE comprehensive BigQuery query.
 
-    This query fetches:
-    1. PRs authored by agents (user.login matches identifier)
-    2. PRs with co-authored-by (search in body for co-authored-by)
-    3. PRs from branches starting with agent identifier (head.ref pattern)
+    This query fetches PRs authored by agents (user.login matches identifier).
 
     Args:
         client: BigQuery client instance
@@ -179,20 +176,8 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     # Generate table UNION statements for the time range
     table_union = generate_table_union_statements(start_date, end_date)
 
-    # Build identifier lists for SQL IN clauses
-    # For author matching, include identifiers with [bot]
-    author_list = ', '.join([f"'{id}'" for id in identifiers if '[bot]' in id])
-
-    # For branch matching and co-author, use stripped identifiers (without [bot])
-    stripped_identifiers = [id.replace('[bot]', '') for id in identifiers]
-
-    # Build co-author pattern (search in body)
-    coauthor_patterns = ' OR '.join([f"LOWER(JSON_EXTRACT_SCALAR(payload, '$.pull_request.body')) LIKE '%co-authored-by: {id.lower()}%'"
-                                      for id in stripped_identifiers if id])
-
-    # Build branch pattern
-    branch_patterns = ' OR '.join([f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') LIKE '{id}/%'"
-                                   for id in stripped_identifiers if id])
+    # Build identifier list for SQL IN clause (author matching only)
+    author_list = ', '.join([f"'{id}'" for id in identifiers])
 
     # Build comprehensive query with CTE
     query = f"""
@@ -201,8 +186,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       SELECT
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as html_url,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') as pr_author,
-        JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') as branch_name,
-        JSON_EXTRACT_SCALAR(payload, '$.pull_request.body') as pr_body,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.created_at') as created_at,
         CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as is_merged,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
@@ -215,16 +198,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       WHERE
         type = 'PullRequestEvent'
         AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
-        AND (
-          -- Match PRs authored by agents with [bot] suffix
-          {f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') IN ({author_list})" if author_list else "FALSE"}
-          {" OR " if author_list and (coauthor_patterns or branch_patterns) else ""}
-          -- Match PRs with co-authored-by in body
-          {f"({coauthor_patterns})" if coauthor_patterns else ""}
-          {" OR " if coauthor_patterns and branch_patterns else ""}
-          -- Match PRs with branch names starting with agent identifier
-          {f"({branch_patterns})" if branch_patterns else ""}
-        )
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') IN ({author_list})
     ),
 
     pr_latest_state AS (
@@ -232,8 +206,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       SELECT
         html_url,
         pr_author,
-        branch_name,
-        pr_body,
         created_at,
         merged_at,
         closed_at,
@@ -245,8 +217,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     SELECT DISTINCT
       html_url,
       pr_author,
-      branch_name,
-      pr_body,
       created_at,
       merged_at,
       -- Only include closed_at if PR is closed but not merged
@@ -292,30 +262,10 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
                 'closed_at': closed_at,
             }
 
-            # Assign to agent based on author, co-author, or branch pattern
+            # Assign to agent based on author
             pr_author = row.pr_author
-            branch_name = row.branch_name or ''
-            pr_body = (row.pr_body or '').lower()
-
-            # First, try to match by author
             if pr_author and pr_author in identifiers:
                 metadata_by_agent[pr_author].append(pr_data)
-            else:
-                # Try to match by co-author or branch pattern
-                for identifier in identifiers:
-                    stripped_id = identifier.replace('[bot]', '')
-                    if not stripped_id:
-                        continue
-
-                    # Check co-author
-                    if f'co-authored-by: {stripped_id.lower()}' in pr_body:
-                        metadata_by_agent[identifier].append(pr_data)
-                        break
-
-                    # Check branch pattern
-                    if branch_name.startswith(f"{stripped_id}/"):
-                        metadata_by_agent[identifier].append(pr_data)
-                        break
 
         # Print breakdown by agent
         print(f"\n   📊 Results breakdown by agent:")

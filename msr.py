@@ -21,7 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
-LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for mining new PRs
+LEADERBOARD_TIME_FRAME_DAYS = 3  # Time frame for mining new PRs
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -152,14 +152,13 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     # Generate table UNION statements for the time range
     table_union = generate_table_union_statements(start_date, end_date)
 
-    # Build identifier lists for SQL IN clauses
-    # For author matching, include identifiers with [bot]
-    author_list = ', '.join([f"'{id}'" for id in identifiers if '[bot]' in id])
+    # Build identifier list for SQL IN clause (author matching only)
+    author_list = ', '.join([f"'{id}'" for id in identifiers])
 
-    # For branch matching, use stripped identifiers (without [bot])
-    stripped_identifiers = [id.replace('[bot]', '') for id in identifiers]
-    branch_patterns = ' OR '.join([f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') LIKE '{id}/%'"
-                                   for id in stripped_identifiers if id])
+    # # Debug: Print identifier info
+    # print(f"   🔍 DEBUG: Matching {len(identifiers)} agent identifiers")
+    # print(f"   🔍 DEBUG: Sample identifiers: {identifiers[:3]}")
+    # print(f"   🔍 DEBUG: Author list sample: {author_list[:200]}...")
 
     # Build comprehensive query with CTE
     query = f"""
@@ -168,7 +167,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       SELECT
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as url,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') as pr_author,
-        JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') as branch_name,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.created_at') as created_at,
         CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as is_merged,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
@@ -181,13 +179,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       WHERE
         type = 'PullRequestEvent'
         AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
-        AND (
-          -- Match PRs authored by agents with [bot] suffix
-          {f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') IN ({author_list})" if author_list else "FALSE"}
-          {"OR" if author_list and branch_patterns else ""}
-          -- Match PRs with branch names starting with agent identifier
-          {f"({branch_patterns})" if branch_patterns else ""}
-        )
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') IN ({author_list})
     ),
 
     pr_latest_state AS (
@@ -195,7 +187,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       SELECT
         url,
         pr_author,
-        branch_name,
         created_at,
         merged_at,
         closed_at,
@@ -207,7 +198,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     SELECT DISTINCT
       url,
       pr_author,
-      branch_name,
       created_at,
       merged_at,
       -- Only include closed_at if PR is closed but not merged
@@ -222,6 +212,12 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
 
     print(f"   Querying {(end_date - start_date).days} days of GitHub Archive data...")
     print(f"   Agents: {', '.join(identifiers[:5])}{'...' if len(identifiers) > 5 else ''}")
+
+    # # Debug: Print the actual query
+    # print(f"\n   🔍 DEBUG: Generated SQL Query:")
+    # print("   " + "="*70)
+    # print(query)
+    # print("   " + "="*70 + "\n")
 
     try:
         query_job = client.query(query)
@@ -253,20 +249,10 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
                 'closed_at': closed_at,
             }
 
-            # Assign to agent based on author or branch pattern
+            # Assign to agent based on author
             pr_author = row.pr_author
-            branch_name = row.branch_name or ''
-
-            # First, try to match by author
             if pr_author and pr_author in identifiers:
                 metadata_by_agent[pr_author].append(pr_data)
-            else:
-                # Try to match by branch pattern
-                for identifier in identifiers:
-                    stripped_id = identifier.replace('[bot]', '')
-                    if stripped_id and branch_name.startswith(f"{stripped_id}/"):
-                        metadata_by_agent[identifier].append(pr_data)
-                        break
 
         # Print breakdown by agent
         print(f"\n   📊 Results breakdown by agent:")
