@@ -66,6 +66,37 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
+def parse_date_string(date_string):
+    """
+    Parse date string to datetime object, handling various formats.
+
+    Handles:
+    - ISO format with 'T' or space between date and time
+    - Timezone with 'Z' or incomplete offset (+00, -00)
+    - Complete timezone offset (+00:00, -00:00)
+
+    Args:
+        date_string: Date string in various formats
+
+    Returns:
+        datetime object or raises exception
+    """
+    if not date_string:
+        raise ValueError("Empty date string")
+
+    # Replace space with 'T' for ISO format compatibility
+    date_string = date_string.replace(' ', 'T')
+
+    # Fix incomplete timezone offset (+00 or -00 -> +00:00 or -00:00)
+    if date_string[-3:-2] in ('+', '-') and ':' not in date_string[-3:]:
+        date_string = date_string + ':00'
+
+    # Parse the date string (handles both with and without microseconds)
+    dt = datetime.fromisoformat(date_string.replace('Z', '+00:00'))
+
+    return dt
+
+
 # =============================================================================
 # BIGQUERY FUNCTIONS
 # =============================================================================
@@ -423,7 +454,7 @@ def calculate_monthly_metrics_by_agent(top_n=None):
         agent_name = identifier_to_name.get(agent_identifier, agent_identifier)
 
         try:
-            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            dt = parse_date_string(created_at)
             month_key = f"{dt.year}-{dt.month:02d}"
             agent_month_data[agent_name][month_key].append(pr_meta)
         except Exception as e:
@@ -514,7 +545,7 @@ def group_metadata_by_date(metadata_list):
             continue
 
         try:
-            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            dt = parse_date_string(created_at)
             key = (dt.year, dt.month, dt.day)
             grouped[key].append(pr_meta)
         except Exception as e:
@@ -665,7 +696,7 @@ def load_pr_metadata():
                     created_at = pr_meta.get('created_at')
                     if created_at:
                         try:
-                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                            dt = parse_date_string(created_at)
                             if dt >= cutoff_date:
                                 pr_meta['agent_identifier'] = agent_identifier
                                 all_metadata.append(pr_meta)
