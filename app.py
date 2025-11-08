@@ -1318,16 +1318,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
                 value=get_leaderboard_dataframe(),
                 datatype=LEADERBOARD_COLUMNS,
                 search_columns=["Agent Name", "Website"],
-                filter_columns=[
-                    ColumnFilter(
-                        "Acceptance Rate (%)",
-                        min=0,
-                        max=100,
-                        default=[0, 100],
-                        type="slider",
-                        label="Acceptance Rate (%)"
-                    )
-                ]
+                filter_columns=["Acceptance Rate (%)"]
             )
 
             gr.Markdown("### Monthly Metrics - Top 5 Agents")
