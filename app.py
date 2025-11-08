@@ -26,6 +26,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"  # HuggingFace dataset for agent metadata
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"  # HuggingFace dataset for PR metadata
+LEADERBOARD_REPO = "SWE-Arena/swe_leaderboard"  # For storing computed leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for constructing leaderboard
 UPDATE_TIME_FRAME_DAYS = 30  # Time frame for mining new PRs
 
@@ -36,6 +37,9 @@ LEADERBOARD_COLUMNS = [
     ("Merged PRs", "number"),
     ("Acceptance Rate (%)", "number"),
 ]
+
+# Global cache for leaderboard data (loaded once at startup)
+_LEADERBOARD_CACHE = None
 
 # =============================================================================
 # JSONL FILE OPERATIONS
@@ -776,6 +780,37 @@ def get_hf_token():
     return token
 
 
+def load_leaderboard_data_from_hf():
+    """
+    Load pre-computed leaderboard and monthly metrics data from HuggingFace.
+
+    Returns:
+        Dictionary with 'leaderboard', 'monthly_metrics', and 'last_updated' keys.
+        Returns None if file doesn't exist or error occurs.
+    """
+    try:
+        token = get_hf_token()
+
+        # Download the swe-pr.json file
+        file_path = hf_hub_download(
+            repo_id=LEADERBOARD_REPO,
+            filename="swe-pr.json",
+            repo_type="dataset",
+            token=token
+        )
+
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+
+        print(f"✓ Loaded leaderboard data (last updated: {data.get('last_updated', 'Unknown')})")
+        return data
+
+    except Exception as e:
+        print(f"⚠️  Could not load leaderboard data from HuggingFace: {str(e)}")
+        print(f"   Falling back to computing from raw PR metadata...")
+        return None
+
+
 def upload_with_retry(api, path_or_fileobj, path_in_repo, repo_id, repo_type, token, max_retries=5):
     """
     Upload file to HuggingFace with exponential backoff retry logic.
@@ -1020,7 +1055,37 @@ def create_monthly_metrics_plot(top_n=5):
     Args:
         top_n: Number of top agents to show (default: 5)
     """
-    metrics = calculate_monthly_metrics_by_agent(top_n=top_n)
+    global _LEADERBOARD_CACHE
+
+    # Load from cache if available
+    if _LEADERBOARD_CACHE is not None:
+        metrics = _LEADERBOARD_CACHE.get('monthly_metrics', {})
+
+        # Apply top_n filter if specified
+        if top_n is not None and top_n > 0 and metrics.get('agents'):
+            agents_list = metrics['agents']
+            data = metrics['data']
+
+            # Calculate total PRs for each agent across all months
+            agent_totals = []
+            for agent_name in agents_list:
+                total_pr_count = sum(data[agent_name]['total_prs'])
+                agent_totals.append((agent_name, total_pr_count))
+
+            # Sort by total PRs (descending) and take top N
+            agent_totals.sort(key=lambda x: x[1], reverse=True)
+            top_agents = [agent_name for agent_name, _ in agent_totals[:top_n]]
+
+            # Filter result_data to only include top agents
+            filtered_data = {agent: data[agent] for agent in top_agents if agent in data}
+            metrics = {
+                'agents': top_agents,
+                'months': metrics['months'],
+                'data': filtered_data
+            }
+    else:
+        # Fallback: compute from PR metadata
+        metrics = calculate_monthly_metrics_by_agent(top_n=top_n)
 
     if not metrics['agents'] or not metrics['months']:
         # Return an empty figure with a message
@@ -1129,11 +1194,18 @@ def create_monthly_metrics_plot(top_n=5):
 
 def get_leaderboard_dataframe():
     """
-    Construct leaderboard data from PR metadata and convert to pandas DataFrame for display.
+    Load leaderboard data from cached JSON and convert to pandas DataFrame for display.
+    Falls back to computing from PR metadata if cache is not available.
     Returns formatted DataFrame sorted by total PRs.
     """
-    # Construct leaderboard from PR metadata
-    cache_dict = construct_leaderboard_from_metadata()
+    global _LEADERBOARD_CACHE
+
+    # Load from cache if available
+    if _LEADERBOARD_CACHE is not None:
+        cache_dict = _LEADERBOARD_CACHE.get('leaderboard', {})
+    else:
+        # Fallback: compute from PR metadata
+        cache_dict = construct_leaderboard_from_metadata()
 
     if not cache_dict:
         # Return empty DataFrame with correct columns if no data
@@ -1245,6 +1317,17 @@ print(f"✓ Scheduler initialized successfully")
 print(f"⛏️  Mining schedule: Every Monday at 12:00 AM UTC")
 print(f"📥 On startup: Only loads cached data from HuggingFace (no mining)")
 print(f"{'='*80}\n")
+
+# Load leaderboard data from HuggingFace at startup
+print(f"📥 Loading leaderboard data from HuggingFace...")
+_LEADERBOARD_CACHE = load_leaderboard_data_from_hf()
+
+if _LEADERBOARD_CACHE is None:
+    print(f"⚠️  No cached leaderboard data found - will compute from raw PR metadata")
+else:
+    print(f"✓ Leaderboard cache loaded successfully")
+
+print()
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:

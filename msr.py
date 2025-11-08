@@ -21,6 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
+LEADERBOARD_REPO = "SWE-Arena/swe_leaderboard"  # For storing computed leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for mining new PRs
 
 # =============================================================================
@@ -410,6 +411,298 @@ def load_agents_from_hf():
 
 
 # =============================================================================
+# LEADERBOARD DATA COMPUTATION & STORAGE
+# =============================================================================
+
+def calculate_pr_stats_from_metadata(metadata_list):
+    """
+    Calculate statistics from a list of PR metadata.
+
+    Returns a dictionary with comprehensive PR metrics.
+    Acceptance rate = merged PRs / (merged PRs + closed but not merged PRs) * 100
+    """
+    total_prs = len(metadata_list)
+    merged = sum(1 for pr_meta in metadata_list if pr_meta.get('merged_at'))
+
+    # Count closed PRs (rejected) - those with closed_at but no merged_at
+    closed_not_merged = sum(1 for pr_meta in metadata_list
+                           if pr_meta.get('closed_at') and not pr_meta.get('merged_at'))
+
+    # Total decisions made = merged + closed (rejected)
+    total_decisions = merged + closed_not_merged
+
+    # Calculate acceptance rate based on decisions made
+    acceptance_rate = (merged / total_decisions * 100) if total_decisions > 0 else 0
+
+    return {
+        'total_prs': total_prs,
+        'merged_prs': merged,
+        'acceptance_rate': round(acceptance_rate, 2),
+    }
+
+
+def calculate_monthly_metrics(all_metadata, agents):
+    """
+    Calculate monthly metrics for all agents for visualization.
+
+    Args:
+        all_metadata: List of all PR metadata with agent_identifier field
+        agents: List of agent data dictionaries
+
+    Returns:
+        dict with monthly metrics organized by agent
+    """
+    from datetime import datetime, timezone
+
+    # Create mapping from agent_identifier to agent_name
+    identifier_to_name = {
+        agent.get('github_identifier'): agent.get('name', agent.get('agent_name', 'Unknown'))
+        for agent in agents
+        if agent.get('github_identifier')
+    }
+
+    # Group by agent and month
+    agent_month_data = defaultdict(lambda: defaultdict(list))
+
+    for pr_meta in all_metadata:
+        agent_identifier = pr_meta.get('agent_identifier')
+        created_at = pr_meta.get('created_at')
+
+        if not agent_identifier or not created_at:
+            continue
+
+        # Get agent_name from identifier
+        agent_name = identifier_to_name.get(agent_identifier, agent_identifier)
+
+        try:
+            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            month_key = f"{dt.year}-{dt.month:02d}"
+            agent_month_data[agent_name][month_key].append(pr_meta)
+        except Exception as e:
+            print(f"Warning: Could not parse date '{created_at}': {e}")
+            continue
+
+    # Get all unique months and sort them
+    all_months = set()
+    for agent_data in agent_month_data.values():
+        all_months.update(agent_data.keys())
+    months = sorted(list(all_months))
+
+    # Calculate metrics for each agent and month
+    result_data = {}
+    for agent_name, month_dict in agent_month_data.items():
+        acceptance_rates = []
+        total_prs = []
+        merged_prs = []
+        closed_not_merged_list = []
+
+        for month in months:
+            prs_in_month = month_dict.get(month, [])
+
+            # Count merged PRs
+            merged_count = sum(1 for pr in prs_in_month if pr.get('merged_at'))
+
+            # Count closed but not merged
+            closed_not_merged_count = sum(1 for pr in prs_in_month
+                                         if pr.get('closed_at') and not pr.get('merged_at'))
+
+            # Total PRs created in this month
+            total_count = len(prs_in_month)
+
+            # Calculate acceptance rate
+            total_decisions = merged_count + closed_not_merged_count
+            acceptance_rate = (merged_count / total_decisions * 100) if total_decisions > 0 else None
+
+            acceptance_rates.append(acceptance_rate)
+            total_prs.append(total_count)
+            merged_prs.append(merged_count)
+            closed_not_merged_list.append(closed_not_merged_count)
+
+        result_data[agent_name] = {
+            'acceptance_rates': acceptance_rates,
+            'total_prs': total_prs,
+            'merged_prs': merged_prs,
+            'closed_not_merged': closed_not_merged_list
+        }
+
+    agents_list = sorted(list(agent_month_data.keys()))
+
+    return {
+        'agents': agents_list,
+        'months': months,
+        'data': result_data
+    }
+
+
+def load_all_pr_metadata_from_hf(agents):
+    """
+    Load all PR metadata from HuggingFace dataset for all agents.
+
+    Args:
+        agents: List of agent dictionaries with github_identifier
+
+    Returns:
+        List of PR metadata with agent_identifier field added
+    """
+    try:
+        api = HfApi()
+        token = get_hf_token()
+
+        # Calculate cutoff date
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
+        # List all files in the repository
+        files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
+
+        # Filter for files within the time frame
+        relevant_files = []
+        for f in files:
+            if f.endswith('.jsonl'):
+                parts = f.split('/')
+                if len(parts) == 2:
+                    filename = parts[1]
+                    try:
+                        date_part = filename.replace('.jsonl', '')
+                        date_components = date_part.split('.')
+                        if len(date_components) == 3:
+                            file_year, file_month, file_day = map(int, date_components)
+                            file_date = datetime(file_year, file_month, file_day, tzinfo=timezone.utc)
+
+                            if file_date >= cutoff_date:
+                                relevant_files.append(f)
+                    except Exception:
+                        continue
+
+        print(f"\n📥 Loading PR metadata from {len(relevant_files)} daily files...")
+
+        all_metadata = []
+        for filename in relevant_files:
+            try:
+                parts = filename.split('/')
+                if len(parts) != 2:
+                    continue
+
+                agent_identifier = parts[0]
+
+                file_path = hf_hub_download(
+                    repo_id=PR_METADATA_REPO,
+                    filename=filename,
+                    repo_type="dataset",
+                    token=token
+                )
+                day_metadata = load_jsonl(file_path)
+
+                # Add agent_identifier to each PR
+                for pr_meta in day_metadata:
+                    created_at = pr_meta.get('created_at')
+                    if created_at:
+                        try:
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                            if dt >= cutoff_date:
+                                pr_meta['agent_identifier'] = agent_identifier
+                                all_metadata.append(pr_meta)
+                        except Exception:
+                            continue
+
+            except Exception as e:
+                print(f"   Warning: Could not load {filename}: {str(e)}")
+
+        print(f"✓ Loaded {len(all_metadata)} total PRs")
+        return all_metadata
+
+    except Exception as e:
+        print(f"✗ Error loading PR metadata: {str(e)}")
+        return []
+
+
+def construct_leaderboard_from_metadata(all_metadata, agents):
+    """
+    Construct leaderboard data from PR metadata.
+
+    Args:
+        all_metadata: List of PR metadata with agent_identifier field
+        agents: List of agent dictionaries
+
+    Returns:
+        Dictionary mapping agent identifier to stats
+    """
+    cache_dict = {}
+
+    for agent in agents:
+        identifier = agent.get('github_identifier')
+        agent_name = agent.get('name', agent.get('agent_name', 'Unknown'))
+
+        # Filter metadata for this agent
+        agent_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]
+
+        # Calculate stats
+        stats = calculate_pr_stats_from_metadata(agent_metadata)
+
+        cache_dict[identifier] = {
+            'agent_name': agent_name,
+            'website': agent.get('website', 'Unknown'),
+            'github_identifier': identifier,
+            **stats
+        }
+
+    return cache_dict
+
+
+def save_leaderboard_data_to_hf(leaderboard_data, monthly_metrics):
+    """
+    Save computed leaderboard and monthly metrics to HuggingFace dataset as swe-pr.json.
+
+    Args:
+        leaderboard_data: Dictionary with agent stats (from construct_leaderboard)
+        monthly_metrics: Dictionary with monthly metrics (from calculate_monthly_metrics)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        token = get_hf_token()
+        if not token:
+            raise Exception("No HuggingFace token found")
+
+        api = HfApi(token=token)
+
+        # Combine data into single JSON structure
+        combined_data = {
+            'leaderboard': leaderboard_data,
+            'monthly_metrics': monthly_metrics,
+            'last_updated': datetime.now(timezone.utc).isoformat()
+        }
+
+        # Save to temp file
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        try:
+            json.dump(combined_data, temp_file, indent=2)
+            temp_file.close()
+
+            # Upload to HuggingFace
+            print(f"\n📤 Uploading leaderboard data to {LEADERBOARD_REPO}/swe-pr.json...")
+            api.upload_file(
+                path_or_fileobj=temp_file.name,
+                path_in_repo="swe-pr.json",
+                repo_id=LEADERBOARD_REPO,
+                repo_type="dataset"
+            )
+            print(f"✓ Leaderboard data uploaded successfully")
+            return True
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+
+    except Exception as e:
+        print(f"✗ Error saving leaderboard data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# =============================================================================
 # MAIN MINING FUNCTION
 # =============================================================================
 
@@ -506,6 +799,41 @@ def mine_all_agents():
     print(f"   Errors: {error_count}")
     print(f"   BigQuery queries executed: 1")
     print(f"{'='*80}\n")
+
+    # Compute and save leaderboard data
+    print(f"\n{'='*80}")
+    print(f"📊 Computing leaderboard and monthly metrics...")
+    print(f"{'='*80}\n")
+
+    try:
+        # Load all PR metadata from HuggingFace
+        all_pr_metadata = load_all_pr_metadata_from_hf(agents)
+
+        if all_pr_metadata:
+            # Construct leaderboard
+            leaderboard_data = construct_leaderboard_from_metadata(all_pr_metadata, agents)
+            print(f"✓ Computed leaderboard for {len(leaderboard_data)} agents")
+
+            # Calculate monthly metrics
+            monthly_metrics = calculate_monthly_metrics(all_pr_metadata, agents)
+            print(f"✓ Computed monthly metrics for {len(monthly_metrics['agents'])} agents across {len(monthly_metrics['months'])} months")
+
+            # Save to HuggingFace
+            if save_leaderboard_data_to_hf(leaderboard_data, monthly_metrics):
+                print(f"\n{'='*80}")
+                print(f"✅ Leaderboard data saved successfully!")
+                print(f"{'='*80}\n")
+            else:
+                print(f"\n{'='*80}")
+                print(f"⚠️  Warning: Failed to save leaderboard data")
+                print(f"{'='*80}\n")
+        else:
+            print(f"⚠️  No PR metadata found to compute leaderboard")
+
+    except Exception as e:
+        print(f"✗ Error computing/saving leaderboard data: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 # =============================================================================
