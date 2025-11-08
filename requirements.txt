@@ -1,5 +1,7 @@
 APScheduler
 datasets
+db-dtypes
+google-cloud-bigquery
 gradio
 gradio_leaderboard
 huggingface_hub
