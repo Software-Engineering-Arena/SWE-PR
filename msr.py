@@ -21,7 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
-LEADERBOARD_TIME_FRAME_DAYS = 30  # Time frame for mining new PRs
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for mining new PRs
 
 # =============================================================================
 # UTILITY FUNCTIONS
