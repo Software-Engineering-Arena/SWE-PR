@@ -894,7 +894,6 @@ def save_agent_to_hf(data):
 
 def save_leaderboard_and_metrics_to_hf():
     """
-    Save leaderboard data and monthly metrics to SWE-Arena/leaderboard_metadata dataset.
     Creates a comprehensive JSON file with both leaderboard stats and monthly metrics.
     If the file exists, it will be overwritten.
 
