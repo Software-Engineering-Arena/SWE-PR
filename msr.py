@@ -19,7 +19,7 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-AGENTS_REPO = "SWE-Arena/swe_agents"
+AGENTS_REPO = "SWE-Arena/bot_metadata"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
 LEADERBOARD_REPO = "SWE-Arena/leaderboard_metadata"  # For storing computed leaderboard data
 LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for mining new PRs
