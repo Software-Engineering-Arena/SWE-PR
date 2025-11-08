@@ -253,6 +253,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       pr_author,
       created_at,
       merged_at,
+      closed_at
     FROM pr_latest_state
     WHERE row_num = 1
     ORDER BY created_at DESC
