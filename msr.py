@@ -9,8 +9,10 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError
 from dotenv import load_dotenv
 from google.cloud import bigquery
+import backoff
 
 # Load environment variables
 load_dotenv()
@@ -112,6 +114,76 @@ def get_hf_token():
     if not token:
         print("Warning: HF_TOKEN not found in environment variables")
     return token
+
+
+# =============================================================================
+# HUGGINGFACE API RETRY WRAPPERS
+# =============================================================================
+
+def is_rate_limit_error(e):
+    """Check if exception is a HuggingFace rate limit error (429)."""
+    if isinstance(e, HfHubHTTPError):
+        return e.response.status_code == 429
+    return False
+
+
+def backoff_handler(details):
+    """Handler to print retry attempt information."""
+    wait_time = details['wait']
+    tries = details['tries']
+    print(f"   ⏳ Rate limited. Retrying in {wait_time:.1f}s (attempt {tries}/8)...")
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    giveup=lambda e: not is_rate_limit_error(e),
+    max_tries=8,
+    jitter=backoff.full_jitter,
+    on_backoff=backoff_handler
+)
+def upload_large_folder_with_backoff(api, **kwargs):
+    """Wrapper for HfApi.upload_large_folder with exponential backoff on rate limits."""
+    return api.upload_large_folder(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    giveup=lambda e: not is_rate_limit_error(e),
+    max_tries=8,
+    jitter=backoff.full_jitter,
+    on_backoff=backoff_handler
+)
+def list_repo_files_with_backoff(api, **kwargs):
+    """Wrapper for HfApi.list_repo_files with exponential backoff on rate limits."""
+    return api.list_repo_files(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    giveup=lambda e: not is_rate_limit_error(e),
+    max_tries=8,
+    jitter=backoff.full_jitter,
+    on_backoff=backoff_handler
+)
+def hf_hub_download_with_backoff(**kwargs):
+    """Wrapper for hf_hub_download with exponential backoff on rate limits."""
+    return hf_hub_download(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    giveup=lambda e: not is_rate_limit_error(e),
+    max_tries=8,
+    jitter=backoff.full_jitter,
+    on_backoff=backoff_handler
+)
+def upload_file_with_backoff(api, **kwargs):
+    """Wrapper for HfApi.upload_file with exponential backoff on rate limits."""
+    return api.upload_file(**kwargs)
 
 
 # =============================================================================
@@ -394,7 +466,8 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
 
             # Upload entire folder using upload_large_folder (optimized for large files)
             print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total PRs)...")
-            api.upload_large_folder(
+            upload_large_folder_with_backoff(
+                api,
                 folder_path=temp_dir,
                 repo_id=PR_METADATA_REPO,
                 repo_type="dataset"
@@ -426,7 +499,7 @@ def load_agents_from_hf():
         agents = []
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=AGENTS_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api, repo_id=AGENTS_REPO, repo_type="dataset")
 
         # Filter for JSON files only
         json_files = [f for f in files if f.endswith('.json')]
@@ -436,7 +509,7 @@ def load_agents_from_hf():
         # Download and parse each JSON file
         for json_file in json_files:
             try:
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=AGENTS_REPO,
                     filename=json_file,
                     repo_type="dataset"
@@ -610,7 +683,7 @@ def load_all_pr_metadata_from_hf(agents):
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
 
         # List all files in the repository
-        files = api.list_repo_files(repo_id=PR_METADATA_REPO, repo_type="dataset")
+        files = list_repo_files_with_backoff(api, repo_id=PR_METADATA_REPO, repo_type="dataset")
 
         # Filter for files within the time frame
         relevant_files = []
@@ -642,7 +715,7 @@ def load_all_pr_metadata_from_hf(agents):
 
                 agent_identifier = parts[0]
 
-                file_path = hf_hub_download(
+                file_path = hf_hub_download_with_backoff(
                     repo_id=PR_METADATA_REPO,
                     filename=filename,
                     repo_type="dataset",
@@ -739,7 +812,8 @@ def save_leaderboard_data_to_hf(leaderboard_data, monthly_metrics):
 
             # Upload to HuggingFace
             print(f"\n📤 Uploading leaderboard data to {LEADERBOARD_REPO}/swe-pr.json...")
-            api.upload_file(
+            upload_file_with_backoff(
+                api,
                 path_or_fileobj=temp_file.name,
                 path_in_repo="swe-pr.json",
                 repo_id=LEADERBOARD_REPO,
