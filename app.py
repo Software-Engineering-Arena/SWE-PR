@@ -281,6 +281,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       pr_author,
       created_at,
       merged_at,
+      closed_at
     FROM pr_latest_state
     WHERE row_num = 1
     ORDER BY created_at DESC
@@ -439,7 +440,7 @@ def calculate_monthly_metrics_by_agent(top_n=None):
     agents = load_agents_from_hf()
 
     # Create mapping from agent_identifier to agent_name
-    identifier_to_name = {agent.get('github_identifier'): agent.get('agent_name') for agent in agents if agent.get('github_identifier')}
+    identifier_to_name = {agent.get('github_identifier'): agent.get('name', agent.get('agent_name', 'Unknown')) for agent in agents if agent.get('github_identifier')}
 
     # Load all PR metadata from pr_metadata dataset
     all_metadata = load_pr_metadata()
@@ -812,6 +813,11 @@ def load_agents_from_hf():
                 with open(file_path, 'r') as f:
                     agent_data = json.load(f)
 
+                    # Only process agents with status == "public"
+                    if agent_data.get('status') != 'public':
+                        print(f"Skipping {json_file}: status is not 'public'")
+                        continue
+
                     # Extract github_identifier from filename (remove .json extension)
                     github_identifier = json_file.replace('.json', '')
                     agent_data['github_identifier'] = github_identifier
@@ -1084,7 +1090,7 @@ def mine_all_agents():
 
     for i, agent in enumerate(agents, 1):
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        agent_name = agent.get('name', agent.get('agent_name', 'Unknown'))
 
         if not identifier:
             print(f"[{i}/{len(agents)}] Skipping agent without identifier")
@@ -1155,7 +1161,7 @@ def construct_leaderboard_from_metadata():
 
     for agent in agents:
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        agent_name = agent.get('name', agent.get('agent_name', 'Unknown'))
 
         # Filter metadata for this agent
         agent_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]

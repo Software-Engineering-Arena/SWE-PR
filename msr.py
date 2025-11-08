@@ -286,7 +286,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
                 closed_at = closed_at.isoformat()
 
             pr_data = {
-                'url': row.url,
+                'html_url': row.url,
                 'created_at': created_at,
                 'merged_at': merged_at,
                 'closed_at': closed_at,
