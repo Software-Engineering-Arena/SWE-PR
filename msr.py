@@ -1,17 +1,16 @@
 """
 Minimalist PR Metadata Mining Script
-Mines PR metadata from GitHub and saves to HuggingFace dataset.
+Mines PR metadata from GitHub Archive via BigQuery and saves to HuggingFace dataset.
 """
 
 import json
 import os
-import time
-import requests
+import tempfile
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from huggingface_hub import HfApi, hf_hub_download
 from dotenv import load_dotenv
-import random
+from google.cloud import bigquery
 
 # Load environment variables
 load_dotenv()
@@ -52,212 +51,58 @@ def save_jsonl(filename, data):
             f.write(json.dumps(item) + '\n')
 
 
-def get_github_tokens():
-    """Get all GitHub tokens from environment variables (all vars starting with GITHUB_TOKEN)."""
-    tokens = []
-    for key, value in os.environ.items():
-        if key.startswith('GITHUB_TOKEN') and value:
-            tokens.append(value)
+def get_bigquery_client():
+    """
+    Initialize BigQuery client using credentials from environment variable.
 
-    if not tokens:
-        print("Warning: No GITHUB_TOKEN* found. API rate limits: 60/hour (authenticated: 5000/hour)")
+    Expects GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable containing
+    the service account JSON credentials as a string.
+    """
+    # Get the JSON content from environment variable
+    creds_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+
+    if creds_json:
+        # Create a temporary file to store credentials
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
+            temp_file.write(creds_json)
+            temp_path = temp_file.name
+
+        # Set environment variable to point to temp file
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_path
+
+        # Initialize BigQuery client
+        client = bigquery.Client()
+
+        # Clean up temp file
+        os.unlink(temp_path)
+
+        return client
     else:
-        print(f"✓ Loaded {len(tokens)} GitHub token(s) for token pool")
-
-    return tokens
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON not found in environment")
 
 
-def get_github_token():
-    """Get primary GitHub token from environment variables (for backward compatibility)."""
-    token = os.getenv('GITHUB_TOKEN')
-    if not token:
-        print("Warning: GITHUB_TOKEN not found. API rate limits: 60/hour (authenticated: 5000/hour)")
-    return token
-
-
-class TokenPool:
+def generate_table_union_statements(start_date, end_date):
     """
-    Hybrid token pool that manages GitHub tokens with parallel execution and round-robin fallback.
+    Generate UNION ALL statements for githubarchive.day tables in date range.
 
-    Strategy:
-    - 50% of tokens allocated to parallel pool (for concurrent API calls)
-    - 50% of tokens allocated to round-robin pool (for rate limit fallback)
-    - Automatically switches to round-robin when parallel tokens hit rate limits
-    - Thread-safe for concurrent access
+    Args:
+        start_date: Start datetime
+        end_date: End datetime
+
+    Returns:
+        String with UNION ALL SELECT statements for all tables in range
     """
-    def __init__(self, tokens):
-        import threading
+    table_names = []
+    current_date = start_date
 
-        self.all_tokens = tokens if tokens else [None]
-        self.lock = threading.Lock()
+    while current_date < end_date:
+        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
+        table_names.append(table_name)
+        current_date += timedelta(days=1)
 
-        # Split tokens into parallel and round-robin pools (50/50)
-        total_tokens = len(self.all_tokens)
-        split_point = max(1, total_tokens // 2)  # At least 1 token in each pool
-
-        self.parallel_tokens = self.all_tokens[:split_point]
-        self.roundrobin_tokens = self.all_tokens[split_point:]
-
-        # If only 1 token, use it in both pools
-        if total_tokens == 1:
-            self.parallel_tokens = self.all_tokens
-            self.roundrobin_tokens = self.all_tokens
-
-        # Track rate-limited tokens with reset times
-        self.rate_limited_parallel = {}  # {token: reset_timestamp}
-        self.rate_limited_roundrobin = {}  # {token: reset_timestamp}
-
-        # Round-robin index for fallback pool
-        self.roundrobin_index = 0
-
-        # Statistics
-        self.parallel_calls = 0
-        self.roundrobin_calls = 0
-        self.fallback_triggers = 0
-
-        print(f"🔄 Hybrid Token Pool initialized:")
-        print(f"   Total tokens: {total_tokens}")
-        print(f"   Parallel pool: {len(self.parallel_tokens)} token(s)")
-        print(f"   Round-robin pool: {len(self.roundrobin_tokens)} token(s)")
-
-    def _clean_expired_rate_limits(self):
-        """Remove tokens from rate limit tracking if their reset time has passed."""
-        current_time = time.time()
-
-        # Clean parallel pool
-        expired_parallel = [token for token, reset_time in self.rate_limited_parallel.items()
-                           if current_time >= reset_time]
-        for token in expired_parallel:
-            del self.rate_limited_parallel[token]
-
-        # Clean round-robin pool
-        expired_roundrobin = [token for token, reset_time in self.rate_limited_roundrobin.items()
-                             if current_time >= reset_time]
-        for token in expired_roundrobin:
-            del self.rate_limited_roundrobin[token]
-
-    def get_parallel_token(self):
-        """
-        Get a token from the parallel pool for concurrent execution.
-        Returns None if all parallel tokens are rate-limited.
-        """
-        with self.lock:
-            self._clean_expired_rate_limits()
-
-            # Find first non-rate-limited token in parallel pool
-            for token in self.parallel_tokens:
-                if token not in self.rate_limited_parallel:
-                    self.parallel_calls += 1
-                    return token
-
-            return None  # All parallel tokens are rate-limited
-
-    def get_available_parallel_tokens(self):
-        """
-        Get all available tokens from parallel pool (not rate-limited).
-        Used for batch parallel execution.
-        """
-        with self.lock:
-            self._clean_expired_rate_limits()
-            available = [token for token in self.parallel_tokens
-                        if token not in self.rate_limited_parallel]
-            return available
-
-    def get_roundrobin_token(self):
-        """
-        Get the next token from round-robin pool (fallback mechanism).
-        Skips rate-limited tokens and rotates to the next available one.
-        """
-        with self.lock:
-            self._clean_expired_rate_limits()
-
-            attempts = 0
-            max_attempts = len(self.roundrobin_tokens)
-
-            while attempts < max_attempts:
-                token = self.roundrobin_tokens[self.roundrobin_index]
-                self.roundrobin_index = (self.roundrobin_index + 1) % len(self.roundrobin_tokens)
-
-                if token not in self.rate_limited_roundrobin:
-                    self.roundrobin_calls += 1
-                    return token
-
-                attempts += 1
-
-            # All round-robin tokens are rate-limited
-            return None
-
-    def get_next_token(self):
-        """
-        Get the next available token (try parallel first, fallback to round-robin).
-        This is the main method for backwards compatibility.
-        """
-        # Try parallel pool first
-        token = self.get_parallel_token()
-        if token:
-            return token
-
-        # Fallback to round-robin
-        with self.lock:
-            self.fallback_triggers += 1
-
-        token = self.get_roundrobin_token()
-        if token:
-            return token
-
-        # All tokens exhausted - return first parallel token anyway (will hit rate limit)
-        return self.parallel_tokens[0] if self.parallel_tokens else None
-
-    def get_headers(self):
-        """Get headers with the next available token."""
-        token = self.get_next_token()
-        return {'Authorization': f'token {token}'} if token else {}
-
-    def mark_rate_limited(self, token, reset_timestamp=None):
-        """
-        Mark a token as rate-limited with optional reset timestamp.
-
-        Args:
-            token: The token that hit rate limit
-            reset_timestamp: Unix timestamp when rate limit resets (optional)
-        """
-        with self.lock:
-            # Default to 1 hour from now if no reset time provided
-            if reset_timestamp is None:
-                reset_timestamp = time.time() + 3600
-
-            # Mark in appropriate pool
-            if token in self.parallel_tokens:
-                self.rate_limited_parallel[token] = reset_timestamp
-                print(f"   ⚠️ Parallel token marked as rate-limited until {datetime.fromtimestamp(reset_timestamp, timezone.utc).strftime('%H:%M:%S UTC')}")
-
-            if token in self.roundrobin_tokens:
-                self.rate_limited_roundrobin[token] = reset_timestamp
-                print(f"   ⚠️ Round-robin token marked as rate-limited until {datetime.fromtimestamp(reset_timestamp, timezone.utc).strftime('%H:%M:%S UTC')}")
-
-    def get_stats(self):
-        """Get usage statistics for monitoring."""
-        with self.lock:
-            return {
-                'parallel_calls': self.parallel_calls,
-                'roundrobin_calls': self.roundrobin_calls,
-                'fallback_triggers': self.fallback_triggers,
-                'parallel_rate_limited': len(self.rate_limited_parallel),
-                'roundrobin_rate_limited': len(self.rate_limited_roundrobin)
-            }
-
-    def print_stats(self):
-        """Print usage statistics."""
-        stats = self.get_stats()
-        total_calls = stats['parallel_calls'] + stats['roundrobin_calls']
-
-        if total_calls > 0:
-            print(f"\n📊 Token Pool Statistics:")
-            print(f"   Total API calls: {total_calls}")
-            print(f"   Parallel calls: {stats['parallel_calls']} ({stats['parallel_calls']/total_calls*100:.1f}%)")
-            print(f"   Round-robin calls: {stats['roundrobin_calls']} ({stats['roundrobin_calls']/total_calls*100:.1f}%)")
-            print(f"   Fallback triggers: {stats['fallback_triggers']}")
-            print(f"   Currently rate-limited: {stats['parallel_rate_limited']} parallel, {stats['roundrobin_rate_limited']} round-robin")
+    # Create UNION ALL chain
+    union_parts = [f"SELECT * FROM {table}" for table in table_names]
+    return " UNION ALL ".join(union_parts)
 
 
 def get_hf_token():
@@ -269,555 +114,179 @@ def get_hf_token():
 
 
 # =============================================================================
-# GITHUB API FUNCTIONS
+# BIGQUERY FUNCTIONS
 # =============================================================================
 
-def request_with_backoff(method, url, *, headers=None, params=None, json_body=None, data=None, max_retries=10, timeout=30, token_pool=None, token=None):
+def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date):
     """
-    Perform an HTTP request with exponential backoff and jitter for GitHub API.
-    Retries on 403/429 (rate limits), 5xx server errors, and transient network exceptions.
+    Fetch PR metadata for ALL agents using ONE comprehensive BigQuery query.
+
+    This query fetches:
+    1. PRs authored by agents (user.login matches identifier)
+    2. PRs from branches starting with agent identifier (head.ref pattern)
 
     Args:
-        token_pool: Optional TokenPool instance for marking rate-limited tokens
-        token: Optional token string used for this request (for rate limit tracking)
-
-    Returns the final requests.Response on success or non-retryable status, or None after exhausting retries.
-    """
-    delay = 1.0
-    for attempt in range(max_retries):
-        try:
-            resp = requests.request(
-                method,
-                url,
-                headers=headers or {},
-                params=params,
-                json=json_body,
-                data=data,
-                timeout=timeout
-            )
-
-            status = resp.status_code
-
-            # Success
-            if 200 <= status < 300:
-                return resp
-
-            # Rate limits or server errors -> retry with backoff
-            if status in (403, 429) or 500 <= status < 600:
-                wait = None
-                reset_timestamp = None
-
-                # Prefer Retry-After when present
-                retry_after = resp.headers.get('Retry-After') or resp.headers.get('retry-after')
-                if retry_after:
-                    try:
-                        wait = float(retry_after)
-                    except Exception:
-                        wait = None
-
-                # Fallback to X-RateLimit-Reset when 403/429
-                if wait is None and status in (403, 429):
-                    reset_hdr = resp.headers.get('X-RateLimit-Reset') or resp.headers.get('x-ratelimit-reset')
-                    if reset_hdr:
-                        try:
-                            reset_ts = int(float(reset_hdr))
-                            reset_timestamp = reset_ts
-                            wait = max(reset_ts - time.time() + 2, 1)
-                        except Exception:
-                            wait = None
-
-                # Final fallback: exponential backoff with jitter
-                if wait is None:
-                    wait = delay + random.uniform(0, 0.5)
-
-                # Mark token as rate-limited if we have token pool and token info
-                if status in (403, 429) and token_pool and token:
-                    token_pool.mark_rate_limited(token, reset_timestamp)
-
-                # Cap individual wait to avoid extreme sleeps
-                wait = max(1.0, min(wait, 120.0))
-                print(f"GitHub API {status}. Backing off {wait:.1f}s (attempt {attempt + 1}/{max_retries})...")
-                time.sleep(wait)
-                delay = min(delay * 2, 60.0)
-                continue
-
-            # Non-retryable error; return response for caller to handle
-            return resp
-
-        except requests.RequestException as e:
-            # Network error -> retry with backoff
-            wait = delay + random.uniform(0, 0.5)
-            wait = max(1.0, min(wait, 60.0))
-            print(f"Request error: {e}. Retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})...")
-            time.sleep(wait)
-            delay = min(delay * 2, 60.0)
-
-    print(f"Exceeded max retries for {url}")
-    return None
-
-
-def fetch_prs_within_day_partition(base_query, start_date, end_date, token_pool, prs_by_id, depth=0, max_depth=8):
-    """
-    Recursively fetch PRs within a time range by subdividing into smaller granularities.
-    This function handles INTRA-DAY partitioning (hours → minutes → seconds).
-    
-    Used when a single day query hits the 1000-result limit.
-    Recursion is bounded to prevent stack overflow.
-
-    Args:
-        base_query: Base query string (already includes the day in created: clause)
-        start_date: Start datetime
-        end_date: End datetime
-        token_pool: TokenPool instance for rotating tokens
-        prs_by_id: Dict to store deduplicated PRs by ID
-        depth: Current recursion depth
-        max_depth: Maximum allowed recursion depth
+        client: BigQuery client instance
+        identifiers: List of GitHub usernames/bot identifiers
+        start_date: Start datetime (timezone-aware)
+        end_date: End datetime (timezone-aware)
 
     Returns:
-        Total number of new PRs found in this partition
-    """
-    # Safety limit on recursion depth
-    if depth >= max_depth:
-        print(f"{'  ' * depth}⚠️  Max recursion depth ({max_depth}) reached. Some results may be missing.")
-        return 0
-
-    time_diff = end_date - start_date
-    total_seconds = time_diff.total_seconds()
-
-    # Determine granularity based on time range
-    if total_seconds >= 3600:  # >= 1 hour - subdivide by hours
-        start_str = start_date.strftime('%Y-%m-%dT%H:00:00Z')
-        end_str = end_date.strftime('%Y-%m-%dT%H:59:59Z')
-        granularity = "hour"
-    elif total_seconds >= 60:  # >= 1 minute - subdivide by minutes
-        start_str = start_date.strftime('%Y-%m-%dT%H:%M:00Z')
-        end_str = end_date.strftime('%Y-%m-%dT%H:%M:59Z')
-        granularity = "minute"
-    else:  # < 1 minute - subdivide by seconds
-        start_str = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
-        end_str = end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
-        granularity = "second"
-
-    query = f'{base_query} created:{start_str}..{end_str}'
-    indent = "  " * depth
-
-    print(f"{indent}[Depth {depth}] Searching {granularity} range: {start_str} to {end_str}...")
-
-    page = 1
-    per_page = 100
-    total_in_partition = 0
-
-    while True:
-        url = 'https://api.github.com/search/issues'
-        params = {
-            'q': query,
-            'per_page': per_page,
-            'page': page,
-            'sort': 'created',
-            'order': 'asc'
+        Dictionary mapping agent identifier to list of PR metadata:
+        {
+            'agent-identifier': [
+                {
+                    'url': PR URL,
+                    'created_at': Creation timestamp,
+                    'merged_at': Merge timestamp (if merged, else None),
+                    'closed_at': Close timestamp (if closed but not merged, else None)
+                },
+                ...
+            ],
+            ...
         }
-
-        try:
-            # Get token for tracking
-            token = token_pool.get_next_token()
-            headers = {'Authorization': f'token {token}'} if token else {}
-
-            response = request_with_backoff('GET', url, headers=headers, params=params,
-                                           token_pool=token_pool, token=token)
-            if response is None:
-                print(f"{indent}  ✗ Retries exhausted for {start_str} to {end_str}")
-                return total_in_partition
-
-            if response.status_code != 200:
-                print(f"{indent}  ✗ HTTP {response.status_code} for {start_str} to {end_str}")
-                return total_in_partition
-
-            data = response.json()
-            total_count = data.get('total_count', 0)
-            items = data.get('items', [])
-
-            if not items:
-                break
-
-            # Add PRs to global dict, count new ones
-            for pr in items:
-                pr_id = pr.get('id')
-                if pr_id and pr_id not in prs_by_id:
-                    prs_by_id[pr_id] = pr
-                    total_in_partition += 1
-
-            # Check if we hit the 1000-result limit
-            if total_count > 1000 and page == 10:
-                print(f"{indent}  ⚠️  Hit 1000-result limit ({total_count} total). Subdividing {granularity}...")
-
-                # Check if we can subdivide further
-                if total_seconds < 2:
-                    print(f"{indent}  ⚠️  Cannot subdivide further (< 2 seconds). Some results may be missing.")
-                    break
-
-                # Subdivide based on current granularity
-                if granularity == "hour":
-                    # Split hour into 4 parts (15-minute intervals)
-                    num_splits = 4
-                elif granularity == "minute":
-                    # Split minute into 4 parts (15-second intervals)
-                    num_splits = 4
-                else:  # granularity == "second"
-                    # Can't subdivide seconds further meaningfully
-                    print(f"{indent}  ⚠️  Already at second granularity. Cannot subdivide. Some results may be missing.")
-                    break
-
-                split_duration = time_diff / num_splits
-                total_from_splits = 0
-
-                for i in range(num_splits):
-                    split_start = start_date + split_duration * i
-                    split_end = start_date + split_duration * (i + 1)
-
-                    count = fetch_prs_within_day_partition(
-                        base_query, split_start, split_end, token_pool, prs_by_id, depth + 1, max_depth
-                    )
-                    total_from_splits += count
-
-                return total_from_splits
-
-            # Normal pagination: check if there are more pages
-            if len(items) < per_page or page >= 10:
-                break
-
-            page += 1
-            time.sleep(0.5)  # Courtesy delay between pages
-
-        except Exception as e:
-            print(f"{indent}  ✗ Error fetching {start_str} to {end_str}: {str(e)}")
-            return total_in_partition
-
-    if total_in_partition > 0:
-        print(f"{indent}  ✓ Found {total_in_partition} PRs in {granularity} range")
-
-    return total_in_partition
-
-
-def fetch_prs_with_time_partition(base_query, start_date, end_date, token_pool, prs_by_id):
     """
-    Iteratively fetch PRs by iterating through each day in the date range.
-    For each day, query with daily granularity.
-    If a single day hits the 1000-result limit, subdivide that day recursively (hours → minutes → seconds).
+    print(f"\n🔍 Querying BigQuery for ALL {len(identifiers)} agents in ONE QUERY")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
-    This hybrid iterative-recursive approach prevents deep recursion by:
-    - Using iteration for the outer loop (days)
-    - Using recursion only for intra-day partitioning (hours/minutes/seconds)
+    # Generate table UNION statements for the time range
+    table_union = generate_table_union_statements(start_date, end_date)
 
-    Args:
-        base_query: Base query string (e.g., 'is:pr author:{identifier}')
-        start_date: Start date
-        end_date: End date (inclusive)
-        token_pool: TokenPool instance for rotating tokens
-        prs_by_id: Dict to store deduplicated PRs by ID
+    # Build identifier lists for SQL IN clauses
+    # For author matching, include identifiers with [bot]
+    author_list = ', '.join([f"'{id}'" for id in identifiers if '[bot]' in id])
 
-    Returns:
-        Total number of new PRs found
-    """
-    current_date = start_date
-    total_found = 0
+    # For branch matching, use stripped identifiers (without [bot])
+    stripped_identifiers = [id.replace('[bot]', '') for id in identifiers]
+    branch_patterns = ' OR '.join([f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') LIKE '{id}/%'"
+                                   for id in stripped_identifiers if id])
 
-    # Iterate through each day
-    while current_date <= end_date:
-        day_start = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    # Build comprehensive query with CTE
+    query = f"""
+    WITH pr_events AS (
+      -- Get all PR events (opened, closed) for all agents
+      SELECT
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') as url,
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') as pr_author,
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.head.ref') as branch_name,
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.created_at') as created_at,
+        CAST(JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged') AS BOOL) as is_merged,
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
+        JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
+        JSON_EXTRACT_SCALAR(payload, '$.action') as action,
+        created_at as event_time
+      FROM (
+        {table_union}
+      )
+      WHERE
+        type = 'PullRequestEvent'
+        AND JSON_EXTRACT_SCALAR(payload, '$.pull_request.html_url') IS NOT NULL
+        AND (
+          -- Match PRs authored by agents with [bot] suffix
+          {f"JSON_EXTRACT_SCALAR(payload, '$.pull_request.user.login') IN ({author_list})" if author_list else "FALSE"}
+          {"OR" if author_list and branch_patterns else ""}
+          -- Match PRs with branch names starting with agent identifier
+          {f"({branch_patterns})" if branch_patterns else ""}
+        )
+    ),
 
-        # Ensure we don't go past end_date
-        if day_end > end_date:
-            day_end = end_date
+    pr_latest_state AS (
+      -- Get the latest state for each PR (most recent event)
+      SELECT
+        url,
+        pr_author,
+        branch_name,
+        created_at,
+        merged_at,
+        closed_at,
+        ROW_NUMBER() OVER (PARTITION BY url ORDER BY event_time DESC) as row_num
+      FROM pr_events
+    )
 
-        day_str = current_date.strftime('%Y-%m-%d')
-        print(f"\n📅 Processing day: {day_str}")
-
-        # First, try a simple daily query
-        query = f'{base_query} created:{day_str}'
-        url = 'https://api.github.com/search/issues'
-        params = {
-            'q': query,
-            'per_page': 1,
-            'page': 1,
-            'sort': 'created',
-            'order': 'asc'
-        }
-
-        try:
-            # Get token for tracking
-            token = token_pool.get_next_token()
-            headers = {'Authorization': f'token {token}'} if token else {}
-
-            response = request_with_backoff('GET', url, headers=headers, params=params,
-                                           token_pool=token_pool, token=token)
-            if response and response.status_code == 200:
-                data = response.json()
-                total_count = data.get('total_count', 0)
-
-                if total_count > 1000:
-                    print(f"  ⚠️  Day has {total_count} PRs (exceeds 1000-result limit). Subdividing by time of day...")
-                    # Use recursive intra-day partitioning
-                    count = fetch_prs_within_day_partition(
-                        base_query, day_start, day_end, token_pool, prs_by_id, depth=0
-                    )
-                    total_found += count
-                else:
-                    # Normal case: fetch all PRs for this day
-                    print(f"  Fetching {total_count} PRs...")
-                    page = 1
-                    per_page = 100
-                    day_count = 0
-
-                    while True:
-                        params_page = {
-                            'q': query,
-                            'per_page': per_page,
-                            'page': page,
-                            'sort': 'created',
-                            'order': 'asc'
-                        }
-
-                        # Get token for tracking
-                        token = token_pool.get_next_token()
-                        headers = {'Authorization': f'token {token}'} if token else {}
-
-                        response = request_with_backoff('GET', url, headers=headers, params=params_page,
-                                                       token_pool=token_pool, token=token)
-                        if not response or response.status_code != 200:
-                            break
-
-                        items = response.json().get('items', [])
-                        if not items:
-                            break
-
-                        for pr in items:
-                            pr_id = pr.get('id')
-                            if pr_id and pr_id not in prs_by_id:
-                                prs_by_id[pr_id] = pr
-                                day_count += 1
-
-                        if len(items) < per_page:
-                            break
-
-                        page += 1
-                        time.sleep(0.5)
-
-                    if day_count > 0:
-                        print(f"  ✓ Found {day_count} new PRs for {day_str}")
-                    total_found += day_count
-
-            time.sleep(0.5)  # Courtesy delay between days
-
-        except Exception as e:
-            print(f"  ✗ Error processing {day_str}: {str(e)}")
-            continue
-
-        # Move to next day
-        current_date += timedelta(days=1)
-
-    return total_found
-
-
-def extract_pr_metadata(pr):
-    """
-    Extract minimal PR metadata for efficient storage.
-    Only keeps essential fields: html_url, created_at, merged_at, closed_at.
-    """
-    pull_request = pr.get('pull_request', {})
-
-    # Extract dates
-    created_at = pr.get('created_at')
-    merged_at = pull_request.get('merged_at')
-    closed_at = pr.get('closed_at')
-
-    # Only store closed_at if PR is closed but not merged
-    if merged_at:
-        closed_at = None  # Don't store redundant info
-
-    return {
-        'html_url': pr.get('html_url'),
-        'created_at': created_at,
-        'merged_at': merged_at,
-        'closed_at': closed_at
-    }
-
-
-def fetch_prs_parallel(query_patterns, start_date, end_date, token_pool, max_workers=None):
-    """
-    Fetch PRs for multiple query patterns in parallel using available tokens.
-
-    Args:
-        query_patterns: List of query pattern strings
-        start_date: Start date for PR search
-        end_date: End date for PR search
-        token_pool: TokenPool instance
-        max_workers: Maximum number of concurrent workers (defaults to number of available parallel tokens)
-
-    Returns:
-        Dictionary mapping query pattern to list of PRs found
-    """
-    import concurrent.futures
-
-    # Determine number of workers based on available parallel tokens
-    available_tokens = token_pool.get_available_parallel_tokens()
-    if not available_tokens:
-        # Fall back to sequential if no parallel tokens available
-        print("   ⚠️ No parallel tokens available, using sequential fallback")
-        return None
-
-    if max_workers is None:
-        max_workers = len(available_tokens)
-
-    print(f"   🚀 Starting parallel execution with {max_workers} worker(s)")
-
-    results = {}
-
-    def fetch_single_pattern(pattern):
-        """Fetch PRs for a single query pattern."""
-        prs_by_id = {}
-        try:
-            prs_found = fetch_prs_with_time_partition(
-                pattern,
-                start_date,
-                end_date,
-                token_pool,
-                prs_by_id
-            )
-            return pattern, prs_by_id
-        except Exception as e:
-            print(f"   ✗ Error in parallel fetch for pattern '{pattern}': {str(e)}")
-            return pattern, {}
-
-    # Execute patterns in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_pattern = {
-            executor.submit(fetch_single_pattern, pattern): pattern
-            for pattern in query_patterns
-        }
-
-        # Collect results as they complete
-        for future in concurrent.futures.as_completed(future_to_pattern):
-            pattern = future_to_pattern[future]
-            try:
-                pattern_key, prs = future.result()
-                results[pattern_key] = prs
-                print(f"   ✓ Parallel fetch completed for pattern: {pattern_key}")
-            except Exception as e:
-                print(f"   ✗ Parallel fetch failed for pattern '{pattern}': {str(e)}")
-                results[pattern] = {}
-
-    return results
-
-
-def fetch_all_prs_metadata(identifier, agent_name, token_pool=None, use_parallel=True):
-    """
-    Fetch pull requests associated with a GitHub user or bot for the past LEADERBOARD_TIME_FRAME_DAYS.
-    Returns lightweight metadata instead of full PR objects.
-
-    This function employs time-based partitioning to navigate GitHub's 1000-result limit per query.
-    It searches using multiple query patterns:
-    - is:pr author:{identifier} (PRs authored by the bot)
-    - is:pr "co-authored-by: {identifier}" (PRs with commits co-authored by the bot)
-    - is:pr head:{identifier}/ (PRs with branch names starting with the bot identifier)
-
-    Args:
-        identifier: GitHub username or bot identifier
-        agent_name: Human-readable name of the agent for metadata purposes
-        token_pool: TokenPool instance for rotating tokens
-
-    Returns:
-        List of dictionaries containing minimal PR metadata
+    -- Return deduplicated PR metadata
+    SELECT DISTINCT
+      url,
+      pr_author,
+      branch_name,
+      created_at,
+      merged_at,
+      -- Only include closed_at if PR is closed but not merged
+      CASE
+        WHEN merged_at IS NOT NULL THEN NULL
+        ELSE closed_at
+      END as closed_at
+    FROM pr_latest_state
+    WHERE row_num = 1
+    ORDER BY created_at DESC
     """
 
-    # Define query patterns per rules:
-    # 1) author pattern only if identifier contains "[bot]"
-    # 2) co-author and head patterns use identifier with "[bot]" removed
-    stripped_id = identifier.replace('[bot]', '')
-    query_patterns = []
-    if '[bot]' in identifier:
-        query_patterns.append(f'is:pr author:{identifier}')
-    if stripped_id:
-        query_patterns.append(f'is:pr "co-authored-by: {stripped_id}"')
-        query_patterns.append(f'is:pr head:{stripped_id}/')
+    print(f"   Querying {(end_date - start_date).days} days of GitHub Archive data...")
+    print(f"   Agents: {', '.join(identifiers[:5])}{'...' if len(identifiers) > 5 else ''}")
 
-    # Use a dict to deduplicate PRs by ID
-    prs_by_id = {}
+    try:
+        query_job = client.query(query)
+        results = list(query_job.result())
 
-    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS (excluding today)
-    current_time = datetime.now(timezone.utc)
-    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)  # 12:00 AM today (UTC)
-    start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+        print(f"   ✓ Found {len(results)} total PRs across all agents")
 
-    # Try parallel execution first if enabled
-    if use_parallel and len(query_patterns) > 1:
-        print(f"\n🚀 Attempting parallel execution for {len(query_patterns)} query patterns...")
-        parallel_start_time = time.time()
+        # Group results by agent
+        metadata_by_agent = defaultdict(list)
 
-        parallel_results = fetch_prs_parallel(query_patterns, start_date, end_date, token_pool)
+        for row in results:
+            # Convert datetime objects to ISO strings
+            created_at = row.created_at
+            if hasattr(created_at, 'isoformat'):
+                created_at = created_at.isoformat()
 
-        if parallel_results is not None:
-            # Merge results from parallel execution
-            for pattern, pattern_prs in parallel_results.items():
-                for pr_id, pr in pattern_prs.items():
-                    if pr_id not in prs_by_id:
-                        prs_by_id[pr_id] = pr
+            merged_at = row.merged_at
+            if hasattr(merged_at, 'isoformat'):
+                merged_at = merged_at.isoformat()
 
-            parallel_duration = time.time() - parallel_start_time
-            print(f"\n   ✅ Parallel execution complete: {len(prs_by_id)} unique PRs found")
-            print(f"   ⏱️ Total time: {parallel_duration:.1f} seconds")
+            closed_at = row.closed_at
+            if hasattr(closed_at, 'isoformat'):
+                closed_at = closed_at.isoformat()
 
-            # Print token pool statistics
-            token_pool.print_stats()
-        else:
-            # Fallback to sequential execution
-            print("   ⚠️ Parallel execution not available, falling back to sequential...")
-            use_parallel = False
+            pr_data = {
+                'url': row.url,
+                'created_at': created_at,
+                'merged_at': merged_at,
+                'closed_at': closed_at,
+            }
 
-    # Sequential execution (fallback or if parallel disabled)
-    if not use_parallel or len(query_patterns) <= 1:
-        for query_pattern in query_patterns:
-            print(f"\n🔍 Searching with query: {query_pattern}")
-            print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (today excluded)")
+            # Assign to agent based on author or branch pattern
+            pr_author = row.pr_author
+            branch_name = row.branch_name or ''
 
-            pattern_start_time = time.time()
-            initial_count = len(prs_by_id)
+            # First, try to match by author
+            if pr_author and pr_author in identifiers:
+                metadata_by_agent[pr_author].append(pr_data)
+            else:
+                # Try to match by branch pattern
+                for identifier in identifiers:
+                    stripped_id = identifier.replace('[bot]', '')
+                    if stripped_id and branch_name.startswith(f"{stripped_id}/"):
+                        metadata_by_agent[identifier].append(pr_data)
+                        break
 
-            # Fetch with time partitioning
-            prs_found = fetch_prs_with_time_partition(
-                query_pattern,
-                start_date,
-                end_date,
-                token_pool,
-                prs_by_id
-            )
+        # Print breakdown by agent
+        print(f"\n   📊 Results breakdown by agent:")
+        for identifier in identifiers:
+            count = len(metadata_by_agent.get(identifier, []))
+            if count > 0:
+                metadata = metadata_by_agent[identifier]
+                merged_count = sum(1 for m in metadata if m['merged_at'] is not None)
+                closed_count = sum(1 for m in metadata if m['closed_at'] is not None and m['merged_at'] is None)
+                open_count = count - merged_count - closed_count
+                print(f"      {identifier}: {count} PRs ({merged_count} merged, {closed_count} closed, {open_count} open)")
 
-            pattern_duration = time.time() - pattern_start_time
-            new_prs = len(prs_by_id) - initial_count
+        # Convert defaultdict to regular dict
+        return dict(metadata_by_agent)
 
-            print(f"   ✓ Pattern complete: {new_prs} new PRs found ({prs_found} total fetched, {len(prs_by_id) - initial_count - (prs_found - new_prs)} duplicates)")
-            print(f"   ⏱️ Time taken: {pattern_duration:.1f} seconds")
-
-            time.sleep(1.0)
-
-    # Convert to lightweight metadata
-    all_prs = list(prs_by_id.values())
-
-    print(f"\n✅ COMPLETE: Found {len(all_prs)} unique PRs for {identifier}")
-    print(f"📦 Extracting minimal metadata...")
-
-    metadata_list = [extract_pr_metadata(pr) for pr in all_prs]
-
-    # Calculate memory savings
-    import sys
-    original_size = sys.getsizeof(str(all_prs))
-    metadata_size = sys.getsizeof(str(metadata_list))
-    savings_pct = ((original_size - metadata_size) / original_size * 100) if original_size > 0 else 0
-
-    print(f"💾 Memory efficiency: {original_size // 1024}KB → {metadata_size // 1024}KB (saved {savings_pct:.1f}%)")
-
-    return metadata_list
+    except Exception as e:
+        print(f"   ✗ BigQuery error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {}
 
 
 # =============================================================================
@@ -846,50 +315,18 @@ def group_metadata_by_date(metadata_list):
     return dict(grouped)
 
 
-def upload_with_retry(api, path_or_fileobj, path_in_repo, repo_id, repo_type, token, max_retries=5):
-    """
-    Upload file to HuggingFace with exponential backoff retry logic.
-    """
-    delay = 2.0
-
-    for attempt in range(max_retries):
-        try:
-            api.upload_file(
-                path_or_fileobj=path_or_fileobj,
-                path_in_repo=path_in_repo,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                token=token
-            )
-            if attempt > 0:
-                print(f"   ✓ Upload succeeded on attempt {attempt + 1}/{max_retries}")
-            return True
-
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = delay + random.uniform(0, 1.0)
-                print(f"   ⚠️ Upload failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                print(f"   ⏳ Retrying in {wait_time:.1f} seconds...")
-                time.sleep(wait_time)
-                delay = min(delay * 2, 60.0)
-            else:
-                print(f"   ✗ Upload failed after {max_retries} attempts: {str(e)}")
-                raise
-
-
 def save_pr_metadata_to_hf(metadata_list, agent_identifier):
     """
     Save PR metadata to HuggingFace dataset, organized by [agent_identifier]/YYYY.MM.DD.jsonl.
     Each file is stored in the agent's folder and named YYYY.MM.DD.jsonl for that day's PRs.
 
-    This function APPENDS new metadata and DEDUPLICATES by html_url.
-    Uses batch upload to avoid HuggingFace rate limits (256 commits/hour).
+    This function OVERWRITES existing files completely with fresh data from BigQuery.
+    Uses batch upload to avoid rate limit (uploads entire folder in single operation).
 
     Args:
         metadata_list: List of PR metadata dictionaries
         agent_identifier: GitHub identifier of the agent (used as folder name)
     """
-    import tempfile
     import shutil
 
     try:
@@ -897,76 +334,64 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
         if not token:
             raise Exception("No HuggingFace token found")
 
-        api = HfApi()
+        api = HfApi(token=token)
 
-        # Group by exact date (year, month, day)
+        # Group by date (year, month, day)
         grouped = group_metadata_by_date(metadata_list)
 
-        # Create a temporary directory to prepare all files for batch upload
+        if not grouped:
+            print(f"   No valid metadata to save for {agent_identifier}")
+            return False
+
+        # Create a temporary directory for batch upload
         temp_dir = tempfile.mkdtemp()
-        agent_dir = os.path.join(temp_dir, agent_identifier)
-        os.makedirs(agent_dir, exist_ok=True)
+        agent_folder = os.path.join(temp_dir, agent_identifier)
+        os.makedirs(agent_folder, exist_ok=True)
 
         try:
-            print(f"📦 Preparing {len(grouped)} daily files for batch upload...")
+            print(f"   📦 Preparing batch upload for {len(grouped)} daily files...")
 
+            # Process each daily file
             for (pr_year, month, day), day_metadata in grouped.items():
-                # New structure: [agent_identifier]/YYYY.MM.DD.jsonl
                 filename = f"{agent_identifier}/{pr_year}.{month:02d}.{day:02d}.jsonl"
-                local_path = os.path.join(agent_dir, f"{pr_year}.{month:02d}.{day:02d}.jsonl")
+                local_filename = os.path.join(agent_folder, f"{pr_year}.{month:02d}.{day:02d}.jsonl")
 
-                print(f"   Preparing {len(day_metadata)} PRs for {filename}...")
+                # Sort by created_at for better organization
+                day_metadata.sort(key=lambda x: x.get('created_at', ''), reverse=True)
 
-                # Download existing file if it exists
-                existing_metadata = []
-                try:
-                    file_path = hf_hub_download(
-                        repo_id=PR_METADATA_REPO,
-                        filename=filename,
-                        repo_type="dataset",
-                        token=token
-                    )
-                    existing_metadata = load_jsonl(file_path)
-                    print(f"      Found {len(existing_metadata)} existing PRs, merging...")
-                except Exception:
-                    print(f"      No existing file found, creating new...")
+                # Save to temp directory (complete overwrite, no merging)
+                save_jsonl(local_filename, day_metadata)
+                print(f"      Prepared {len(day_metadata)} PRs for {filename}")
 
-                # Merge and deduplicate by html_url
-                existing_by_url = {meta['html_url']: meta for meta in existing_metadata if meta.get('html_url')}
-                new_by_url = {meta['html_url']: meta for meta in day_metadata if meta.get('html_url')}
-
-                # Update with new data (new data overwrites old)
-                existing_by_url.update(new_by_url)
-                merged_metadata = list(existing_by_url.values())
-
-                # Save to temp directory
-                save_jsonl(local_path, merged_metadata)
-                print(f"      ✓ Prepared {len(merged_metadata)} total PRs")
-
-            # Batch upload entire folder in a single commit
-            print(f"\n📤 Uploading all files for {agent_identifier} in one batch...")
-            api.upload_folder(
+            # Upload entire folder using upload_large_folder (optimized for large files)
+            print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total PRs)...")
+            api.upload_large_folder(
                 folder_path=temp_dir,
                 repo_id=PR_METADATA_REPO,
-                repo_type="dataset",
-                token=token,
-                commit_message=f"Update PR metadata for {agent_identifier}"
+                repo_type="dataset"
             )
-            print(f"   ✓ Successfully uploaded {len(grouped)} files in 1 commit")
+            print(f"   ✓ Batch upload complete for {agent_identifier}")
+
+            return True
 
         finally:
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-        return True
+            # Always clean up temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
 
     except Exception as e:
-        print(f"✗ Error saving PR metadata: {str(e)}")
+        print(f"   ✗ Error saving PR metadata: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def load_agents_from_hf():
-    """Load all agent metadata JSON files from HuggingFace dataset."""
+    """
+    Load all agent metadata JSON files from HuggingFace dataset.
+
+    The github_identifier is extracted from the filename (e.g., 'agent-name[bot].json' -> 'agent-name[bot]')
+    """
     try:
         api = HfApi()
         agents = []
@@ -990,6 +415,11 @@ def load_agents_from_hf():
 
                 with open(file_path, 'r') as f:
                     agent_data = json.load(f)
+
+                    # Extract github_identifier from filename (remove .json extension)
+                    github_identifier = json_file.replace('.json', '')
+                    agent_data['github_identifier'] = github_identifier
+
                     agents.append(agent_data)
 
             except Exception as e:
@@ -1011,54 +441,95 @@ def load_agents_from_hf():
 def mine_all_agents():
     """
     Mine PR metadata for all agents within LEADERBOARD_TIME_FRAME_DAYS and save to HuggingFace.
+    Uses ONE BigQuery query for ALL agents (most efficient approach).
     """
-    # Initialize token pool
-    tokens = get_github_tokens()
-    token_pool = TokenPool(tokens)
-
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
     if not agents:
         print("No agents found in HuggingFace dataset")
         return
 
+    # Extract all identifiers
+    identifiers = [agent['github_identifier'] for agent in agents if agent.get('github_identifier')]
+    if not identifiers:
+        print("No valid agent identifiers found")
+        return
+
     print(f"\n{'='*80}")
-    print(f"Starting PR metadata mining for {len(agents)} agents")
+    print(f"Starting PR metadata mining for {len(identifiers)} agents")
     print(f"Time frame: Last {LEADERBOARD_TIME_FRAME_DAYS} days")
+    print(f"Data source: BigQuery + GitHub Archive (ONE QUERY FOR ALL AGENTS)")
     print(f"{'='*80}\n")
 
-    # Mine each agent
-    for agent in agents:
+    # Initialize BigQuery client
+    try:
+        client = get_bigquery_client()
+    except Exception as e:
+        print(f"✗ Failed to initialize BigQuery client: {str(e)}")
+        return
+
+    # Define time range: past LEADERBOARD_TIME_FRAME_DAYS (excluding today)
+    current_time = datetime.now(timezone.utc)
+    end_date = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=LEADERBOARD_TIME_FRAME_DAYS)
+
+    try:
+        all_metadata = fetch_all_pr_metadata_single_query(
+            client, identifiers, start_date, end_date
+        )
+    except Exception as e:
+        print(f"✗ Error during BigQuery fetch: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Save results for each agent
+    print(f"\n{'='*80}")
+    print(f"💾 Saving results to HuggingFace for each agent...")
+    print(f"{'='*80}\n")
+
+    success_count = 0
+    error_count = 0
+    no_data_count = 0
+
+    for i, agent in enumerate(agents, 1):
         identifier = agent.get('github_identifier')
-        agent_name = agent.get('agent_name', 'Unknown')
+        agent_name = agent.get('name', agent.get('agent_name', 'Unknown'))
 
         if not identifier:
-            print(f"Warning: Skipping agent without identifier: {agent}")
+            print(f"[{i}/{len(agents)}] Skipping agent without identifier")
+            error_count += 1
             continue
 
+        metadata = all_metadata.get(identifier, [])
+
+        print(f"[{i}/{len(agents)}] {agent_name} ({identifier}):")
+
         try:
-            print(f"\n{'='*80}")
-            print(f"Processing: {agent_name} ({identifier})")
-            print(f"{'='*80}")
-
-            # Fetch PR metadata
-            metadata = fetch_all_prs_metadata(identifier, agent_name, token_pool)
-
             if metadata:
-                print(f"💾 Saving {len(metadata)} PR records...")
-                save_pr_metadata_to_hf(metadata, identifier)
-                print(f"✓ Successfully processed {agent_name}")
+                print(f"   💾 Saving {len(metadata)} PR records...")
+                if save_pr_metadata_to_hf(metadata, identifier):
+                    success_count += 1
+                else:
+                    error_count += 1
             else:
-                print(f"   No PRs found for {agent_name}")
+                print(f"   No PRs found")
+                no_data_count += 1
 
         except Exception as e:
-            print(f"✗ Error processing {identifier}: {str(e)}")
+            print(f"   ✗ Error saving {identifier}: {str(e)}")
             import traceback
             traceback.print_exc()
+            error_count += 1
             continue
 
     print(f"\n{'='*80}")
-    print(f"✅ Mining complete for all agents")
+    print(f"✅ Mining complete!")
+    print(f"   Total agents: {len(agents)}")
+    print(f"   Successfully saved: {success_count}")
+    print(f"   No data (skipped): {no_data_count}")
+    print(f"   Errors: {error_count}")
+    print(f"   BigQuery queries executed: 1")
     print(f"{'='*80}\n")
 
 
