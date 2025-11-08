@@ -167,7 +167,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.merged_at') as merged_at,
         JSON_EXTRACT_SCALAR(payload, '$.pull_request.closed_at') as closed_at,
         JSON_EXTRACT_SCALAR(payload, '$.action') as action,
-        t.created_at as event_time
+        created_at as event_time
       FROM (
         {table_union}
       ) t
