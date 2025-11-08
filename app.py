@@ -105,6 +105,61 @@ def parse_date_string(date_string):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
+def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+    """
+    Fetch issue metadata for ALL agents using BATCHED BigQuery queries.
+    Splits agents into smaller batches to avoid performance issues with large numbers of agents.
+
+    Args:
+        client: BigQuery client instance
+        identifiers: List of GitHub usernames/bot identifiers
+        start_date: Start datetime (timezone-aware)
+        end_date: End datetime (timezone-aware)
+        batch_size: Number of agents to process per batch (default: 100)
+
+    Returns:
+        Dictionary mapping agent identifier to list of issue metadata
+    """
+    # Split identifiers into batches
+    batches = [identifiers[i:i + batch_size] for i in range(0, len(identifiers), batch_size)]
+    total_batches = len(batches)
+
+    print(f"\n🔍 Using BATCHED approach for {len(identifiers)} agents")
+    print(f"   Total batches: {total_batches} (batch size: {batch_size})")
+    print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+    # Collect results from all batches
+    all_metadata = {}
+
+    for batch_num, batch_identifiers in enumerate(batches, 1):
+        print(f"\n📦 Processing batch {batch_num}/{total_batches} ({len(batch_identifiers)} agents)...")
+
+        try:
+            # Query each batch
+            batch_results = fetch_all_pr_metadata_single_query(
+                client, batch_identifiers, start_date, end_date
+            )
+
+            # Merge results
+            for identifier, metadata_list in batch_results.items():
+                if identifier in all_metadata:
+                    all_metadata[identifier].extend(metadata_list)
+                else:
+                    all_metadata[identifier] = metadata_list
+
+            print(f"   ✓ Batch {batch_num}/{total_batches} complete")
+
+        except Exception as e:
+            print(f"   ✗ Batch {batch_num}/{total_batches} failed: {str(e)}")
+            print(f"   Continuing with remaining batches...")
+            continue
+
+    total_prs = sum(len(metadata_list) for metadata_list in all_metadata.values())
+    print(f"\n✓ All batches complete! Found {total_prs} total PRs across {len(all_metadata)} agents")
+
+    return all_metadata
+
+
 def get_bigquery_client():
     """
     Initialize BigQuery client using credentials from environment variable.
@@ -161,7 +216,10 @@ def generate_table_union_statements(start_date, end_date):
 
 def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date):
     """
-    Fetch PR metadata for ALL agents using ONE comprehensive BigQuery query.
+    Fetch PR metadata for a BATCH of agents using ONE comprehensive BigQuery query.
+
+    NOTE: This function is designed for smaller batches (~100 agents).
+    For large numbers of agents, use fetch_issue_metadata_batched() instead.
 
     This query fetches PRs authored by agents (user.login matches identifier).
 
@@ -174,7 +232,7 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     Returns:
         Dictionary mapping agent identifier to list of PR metadata
     """
-    print(f"\n🔍 Querying BigQuery for ALL {len(identifiers)} agents in ONE QUERY")
+    print(f"   Querying BigQuery for {len(identifiers)} agents in this batch...")
     print(f"   Time range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
 
     # Generate table UNION statements for the time range
@@ -228,14 +286,14 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     ORDER BY created_at DESC
     """
 
-    print(f"   Querying {(end_date - start_date).days} days of GitHub Archive data...")
-    print(f"   Agents: {', '.join(identifiers[:5])}{'...' if len(identifiers) > 5 else ''}")
+    print(f"   Scanning {(end_date - start_date).days} days of GitHub Archive data...")
+    print(f"   Batch agents: {', '.join(identifiers[:5])}{'...' if len(identifiers) > 5 else ''}")
 
     try:
         query_job = client.query(query)
         results = list(query_job.result())
 
-        print(f"   ✓ Found {len(results)} total PRs across all agents")
+        print(f"   ✓ Found {len(results)} PRs in this batch")
 
         # Group results by agent
         metadata_by_agent = defaultdict(list)
@@ -266,8 +324,8 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
             if pr_author and pr_author in identifiers:
                 metadata_by_agent[pr_author].append(pr_data)
 
-        # Print breakdown by agent
-        print(f"\n   📊 Results breakdown by agent:")
+        # Print breakdown by agent (only show agents with PRs)
+        print(f"   📊 Batch breakdown:")
         for identifier in identifiers:
             count = len(metadata_by_agent.get(identifier, []))
             if count > 0:
@@ -989,7 +1047,7 @@ def mine_all_agents():
     print(f"\n{'='*80}")
     print(f"Starting PR metadata mining for {len(identifiers)} agents")
     print(f"Time frame: Last {UPDATE_TIME_FRAME_DAYS} days")
-    print(f"Data source: BigQuery + GitHub Archive (ONE QUERY FOR ALL AGENTS)")
+    print(f"Data source: BigQuery + GitHub Archive (BATCHED QUERIES)")
     print(f"{'='*80}\n")
 
     # Initialize BigQuery client
@@ -1005,8 +1063,9 @@ def mine_all_agents():
     start_date = end_date - timedelta(days=UPDATE_TIME_FRAME_DAYS)
 
     try:
-        all_metadata = fetch_all_pr_metadata_single_query(
-            client, identifiers, start_date, end_date
+        # Use batched approach for better performance
+        all_metadata = fetch_issue_metadata_batched(
+            client, identifiers, start_date, end_date, batch_size=100
         )
     except Exception as e:
         print(f"✗ Error during BigQuery fetch: {str(e)}")
@@ -1054,13 +1113,17 @@ def mine_all_agents():
             error_count += 1
             continue
 
+    # Calculate number of batches
+    batch_size = 100
+    total_batches = (len(identifiers) + batch_size - 1) // batch_size
+
     print(f"\n{'='*80}")
     print(f"✅ Mining complete!")
     print(f"   Total agents: {len(agents)}")
     print(f"   Successfully saved: {success_count}")
     print(f"   No data (skipped): {no_data_count}")
     print(f"   Errors: {error_count}")
-    print(f"   BigQuery queries executed: 1")
+    print(f"   BigQuery batches executed: {total_batches} (batch size: {batch_size})")
     print(f"{'='*80}\n")
 
     # After mining is complete, save leaderboard and metrics to HuggingFace
