@@ -1154,7 +1154,7 @@ def create_monthly_metrics_plot(top_n=5):
 def get_leaderboard_dataframe():
     """
     Construct leaderboard data from PR metadata and convert to pandas DataFrame for display.
-    Returns formatted DataFrame sorted by acceptance rate.
+    Returns formatted DataFrame sorted by total PRs.
     """
     # Construct leaderboard from PR metadata
     cache_dict = construct_leaderboard_from_metadata()
@@ -1187,9 +1187,9 @@ def get_leaderboard_dataframe():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # Sort by Acceptance Rate (%) descending
-    if "Acceptance Rate (%)" in df.columns and not df.empty:
-        df = df.sort_values(by="Acceptance Rate (%)", ascending=False).reset_index(drop=True)
+    # Sort by Total PRs descending
+    if "Total PRs" in df.columns and not df.empty:
+        df = df.sort_values(by="Total PRs", ascending=False).reset_index(drop=True)
 
     return df
 
@@ -1264,14 +1264,18 @@ scheduler.add_job(
     replace_existing=True
 )
 scheduler.start()
-print(f"✓ Scheduler started: Weekly PR Mining at 12:00 AM UTC every Monday (mines last {UPDATE_TIME_FRAME_DAYS} days)")
+print(f"\n{'='*80}")
+print(f"✓ Scheduler initialized successfully")
+print(f"⛏️  Mining schedule: Every Monday at 12:00 AM UTC")
+print(f"📥 On startup: Only loads cached data from HuggingFace (no mining)")
+print(f"{'='*80}\n")
 
 # Create Gradio interface
 with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
     total_months = LEADERBOARD_TIME_FRAME_DAYS // 30
 
     gr.Markdown("# 🏆 SWE Agent PR Leaderboard")
-    gr.Markdown(f"Track and compare GitHub pull request statistics for SWE agents (last {total_months} months)")
+    gr.Markdown(f"Track and compare GitHub pull request statistics for SWE agents")
 
     with gr.Tabs():
 
