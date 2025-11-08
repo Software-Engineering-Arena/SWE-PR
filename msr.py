@@ -21,7 +21,7 @@ load_dotenv()
 
 AGENTS_REPO = "SWE-Arena/swe_agents"
 PR_METADATA_REPO = "SWE-Arena/pr_metadata"
-LEADERBOARD_TIME_FRAME_DAYS = 3  # Time frame for mining new PRs
+LEADERBOARD_TIME_FRAME_DAYS = 180  # Time frame for mining new PRs
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -155,11 +155,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
     # Build identifier list for SQL IN clause (author matching only)
     author_list = ', '.join([f"'{id}'" for id in identifiers])
 
-    # # Debug: Print identifier info
-    # print(f"   🔍 DEBUG: Matching {len(identifiers)} agent identifiers")
-    # print(f"   🔍 DEBUG: Sample identifiers: {identifiers[:3]}")
-    # print(f"   🔍 DEBUG: Author list sample: {author_list[:200]}...")
-
     # Build comprehensive query with CTE
     query = f"""
     WITH pr_events AS (
@@ -212,12 +207,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
 
     print(f"   Querying {(end_date - start_date).days} days of GitHub Archive data...")
     print(f"   Agents: {', '.join(identifiers[:5])}{'...' if len(identifiers) > 5 else ''}")
-
-    # # Debug: Print the actual query
-    # print(f"\n   🔍 DEBUG: Generated SQL Query:")
-    # print("   " + "="*70)
-    # print(query)
-    # print("   " + "="*70 + "\n")
 
     try:
         query_job = client.query(query)
