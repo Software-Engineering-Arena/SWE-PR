@@ -219,11 +219,6 @@ def fetch_all_pr_metadata_single_query(client, identifiers, start_date, end_date
       pr_author,
       created_at,
       merged_at,
-      -- Only include closed_at if PR is closed but not merged
-      CASE
-        WHEN merged_at IS NOT NULL THEN NULL
-        ELSE closed_at
-      END as closed_at
     FROM pr_latest_state
     WHERE row_num = 1
     ORDER BY created_at DESC
