@@ -86,7 +86,7 @@ def get_bigquery_client():
 
 def generate_table_union_statements(start_date, end_date):
     """
-    Generate UNION ALL statements for githubarchive.day tables in date range.
+    Generate UNION ALL statements for githubarchive.month tables in date range.
 
     Args:
         start_date: Start datetime
@@ -96,12 +96,20 @@ def generate_table_union_statements(start_date, end_date):
         String with UNION ALL SELECT statements for all tables in range
     """
     table_names = []
-    current_date = start_date
 
-    while current_date < end_date:
-        table_name = f"`githubarchive.day.{current_date.strftime('%Y%m%d')}`"
+    # Start from the beginning of start_date's month
+    current_date = start_date.replace(day=1)
+    end_month = end_date.replace(day=1)
+
+    while current_date <= end_month:
+        table_name = f"`githubarchive.month.{current_date.strftime('%Y%m')}`"
         table_names.append(table_name)
-        current_date += timedelta(days=1)
+
+        # Move to next month
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year + 1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month + 1)
 
     # Create UNION ALL chain
     union_parts = [f"SELECT * FROM {table}" for table in table_names]
