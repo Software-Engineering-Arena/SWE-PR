@@ -1108,9 +1108,7 @@ def save_leaderboard_and_metrics_to_hf():
 def mine_all_agents():
     """
     Mine PR metadata for all agents within UPDATE_TIME_FRAME_DAYS and save to HuggingFace.
-    Uses ONE BigQuery query for ALL agents (most efficient approach).
-
-    This runs weekly to refresh the data with the latest PRs from the past UPDATE_TIME_FRAME_DAYS.
+    Uses BATCHED BigQuery queries for all agents (efficient approach).
     """
     # Load agent metadata from HuggingFace
     agents = load_agents_from_hf()
@@ -1467,7 +1465,7 @@ def submit_agent(identifier, agent_name, organization, description, website):
     """
     Submit a new agent to the leaderboard.
     Validates input and saves submission.
-    PR data will be populated by the weekly mining task.
+    PR data will be populated by the monthly mining task.
     """
     # Validate required fields
     if not identifier or not identifier.strip():
@@ -1511,7 +1509,7 @@ def submit_agent(identifier, agent_name, organization, description, website):
     if not save_agent_to_hf(submission):
         return "❌ Failed to save submission", get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
-    success_msg = f"✅ Successfully submitted {agent_name}!\n\nPR data will be populated by the weekly mining task (runs every Monday at 12:00 AM UTC)."
+    success_msg = f"✅ Successfully submitted {agent_name}!\n\nPR data will be populated by the monthly mining task (runs every 1st of the month at 12:00 AM UTC)."
     return success_msg, get_leaderboard_dataframe(), create_monthly_metrics_plot()
 
 
@@ -1523,19 +1521,19 @@ print(f"\n🚀 Starting SWE Agent PR Leaderboard")
 print(f"   Leaderboard time frame: {LEADERBOARD_TIME_FRAME_DAYS} days ({LEADERBOARD_TIME_FRAME_DAYS // 30} months)")
 print(f"   Mining update frequency: Every {UPDATE_TIME_FRAME_DAYS} days\n")
 
-# Start APScheduler for weekly PR mining at 12:00 AM UTC every Monday
+# Start APScheduler for monthly PR mining at 12:00 AM UTC every 1st of the month
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     mine_all_agents,
-    trigger=CronTrigger(day_of_week='mon', hour=0, minute=0),  # 12:00 AM UTC every Monday
-    id='weekly_pr_mining',
-    name='Weekly PR Mining',
+    trigger=CronTrigger(day=1, hour=0, minute=0),  # 12:00 AM UTC every 1st of the month
+    id='monthly_pr_mining',
+    name='Monthly PR Mining',
     replace_existing=True
 )
 scheduler.start()
 print(f"\n{'='*80}")
 print(f"✓ Scheduler initialized successfully")
-print(f"⛏️  Mining schedule: Every Monday at 12:00 AM UTC")
+print(f"⛏️  Mining schedule: Every 1st of the month at 12:00 AM UTC")
 print(f"📥 On startup: Only loads cached data from HuggingFace (no mining)")
 print(f"{'='*80}\n")
 
