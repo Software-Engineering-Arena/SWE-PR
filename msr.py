@@ -557,7 +557,6 @@ def load_agents_from_hf():
 
                     # Only process agents with status == "public"
                     if agent_data.get('status') != 'public':
-                        print(f"Skipping {json_file}: status is not 'public'")
                         continue
 
                     # Extract github_identifier from filename (remove .json extension)
