@@ -199,7 +199,7 @@ def upload_file_with_backoff(api, **kwargs):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True):
+def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=100, upload_immediately=True):
     """
     Fetch issue metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large numbers of agents.
@@ -209,7 +209,7 @@ def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batc
         identifiers: List of GitHub usernames/bot identifiers
         start_date: Start datetime (timezone-aware)
         end_date: End datetime (timezone-aware)
-        batch_size: Number of agents to process per batch (default: 50)
+        batch_size: Number of agents to process per batch (default: 100)
         upload_immediately: If True, upload each batch's results to HuggingFace immediately (default: True)
 
     Returns:
@@ -906,7 +906,7 @@ def mine_all_agents():
         # Use batched approach for better performance
         # upload_immediately=True means each batch uploads to HuggingFace right after BigQuery completes
         all_metadata = fetch_issue_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=50, upload_immediately=True
+            client, identifiers, start_date, end_date, batch_size=100, upload_immediately=True
         )
 
         # Calculate summary statistics
