@@ -1371,7 +1371,7 @@ def create_monthly_metrics_plot(top_n=5):
                 go.Bar(
                     x=x_bars,
                     y=y_bars,
-                    name=f"{agent_name} (PRs)",
+                    name=agent_name,
                     marker=dict(color=color, opacity=0.6),
                     legendgroup=agent_name,
                     showlegend=False,  # Don't show in legend (already shown for line)
