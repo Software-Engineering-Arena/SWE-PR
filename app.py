@@ -177,7 +177,7 @@ def upload_file_with_backoff(api, **kwargs):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=50):
     """
     Fetch issue metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large numbers of agents.
@@ -187,7 +187,7 @@ def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batc
         identifiers: List of GitHub usernames/bot identifiers
         start_date: Start datetime (timezone-aware)
         end_date: End datetime (timezone-aware)
-        batch_size: Number of agents to process per batch (default: 100)
+        batch_size: Number of agents to process per batch (default: 50)
 
     Returns:
         Dictionary mapping agent identifier to list of issue metadata
@@ -1145,7 +1145,7 @@ def mine_all_agents():
     try:
         # Use batched approach for better performance
         all_metadata = fetch_issue_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=100
+            client, identifiers, start_date, end_date, batch_size=50
         )
     except Exception as e:
         print(f"✗ Error during BigQuery fetch: {str(e)}")
@@ -1194,7 +1194,7 @@ def mine_all_agents():
             continue
 
     # Calculate number of batches
-    batch_size = 100
+    batch_size = 50
     total_batches = (len(identifiers) + batch_size - 1) // batch_size
 
     print(f"\n{'='*80}")
@@ -1583,7 +1583,7 @@ with gr.Blocks(title="SWE Agent PR Leaderboard", theme=gr.themes.Soft()) as app:
             gr.Markdown("Track acceptance rates and PR activity over time for the most active agents")
 
             monthly_plot = gr.Plot(
-                value=create_monthly_metrics_plot(top_n=5),
+                value=create_monthly_metrics_plot(),
                 label="Monthly PR Metrics"
             )
 

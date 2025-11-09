@@ -190,7 +190,7 @@ def upload_file_with_backoff(api, **kwargs):
 # BIGQUERY FUNCTIONS
 # =============================================================================
 
-def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=100):
+def fetch_issue_metadata_batched(client, identifiers, start_date, end_date, batch_size=50):
     """
     Fetch issue metadata for ALL agents using BATCHED BigQuery queries.
     Splits agents into smaller batches to avoid performance issues with large numbers of agents.
@@ -876,7 +876,7 @@ def mine_all_agents():
     try:
         # Use batched approach for better performance
         all_metadata = fetch_issue_metadata_batched(
-            client, identifiers, start_date, end_date, batch_size=100
+            client, identifiers, start_date, end_date, batch_size=50
         )
     except Exception as e:
         print(f"✗ Error during BigQuery fetch: {str(e)}")
@@ -925,7 +925,7 @@ def mine_all_agents():
             continue
 
     # Calculate number of batches
-    batch_size = 100
+    batch_size = 50
     total_batches = (len(identifiers) + batch_size - 1) // batch_size
 
     print(f"\n{'='*80}")
