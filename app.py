@@ -132,9 +132,6 @@ def backoff_handler(details):
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
-def upload_large_folder_with_backoff(api, **kwargs):
-    """Wrapper for HfApi.upload_large_folder with exponential backoff on rate limits."""
-    return api.upload_large_folder(**kwargs)
 
 
 @backoff.on_exception(
@@ -165,6 +162,21 @@ def list_repo_files_with_backoff(api, **kwargs):
 def hf_hub_download_with_backoff(**kwargs):
     """Wrapper for hf_hub_download with exponential backoff on rate limits."""
     return hf_hub_download(**kwargs)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    HfHubHTTPError,
+    giveup=lambda e: not is_rate_limit_error(e),
+    max_tries=8,
+    base=300,  # Start at 5 minutes (300 seconds)
+    max_value=3600,  # Cap at 60 minutes (3600 seconds)
+    jitter=backoff.full_jitter,
+    on_backoff=backoff_handler
+)
+def upload_folder_with_backoff(api, **kwargs):
+    """Wrapper for HfApi.upload_folder with exponential backoff on rate limits."""
+    return api.upload_folder(**kwargs)
 
 
 @backoff.on_exception(
@@ -719,13 +731,14 @@ def save_pr_metadata_to_hf(metadata_list, agent_identifier):
                 save_jsonl(local_filename, day_metadata)
                 print(f"      Prepared {len(day_metadata)} PRs for {filename}")
 
-            # Upload entire folder using upload_large_folder (optimized for large files)
+            # Upload entire folder using upload_folder (single commit per agent)
             print(f"   📤 Uploading {len(grouped)} files ({len(metadata_list)} total PRs)...")
-            upload_large_folder_with_backoff(
+            upload_folder_with_backoff(
                 api,
                 folder_path=temp_dir,
                 repo_id=PR_METADATA_REPO,
-                repo_type="dataset"
+                repo_type="dataset",
+                commit_message=f"Update PR metadata for {agent_identifier}"
             )
             print(f"   ✓ Batch upload complete for {agent_identifier}")
 
