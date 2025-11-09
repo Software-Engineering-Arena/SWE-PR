@@ -153,18 +153,6 @@ def backoff_handler(details):
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
-
-
-@backoff.on_exception(
-    backoff.expo,
-    HfHubHTTPError,
-    giveup=lambda e: not is_rate_limit_error(e),
-    max_tries=8,
-    base=300,  # Start at 5 minutes (300 seconds)
-    max_value=3600,  # Cap at 60 minutes (3600 seconds)
-    jitter=backoff.full_jitter,
-    on_backoff=backoff_handler
-)
 def list_repo_files_with_backoff(api, **kwargs):
     """Wrapper for HfApi.list_repo_files with exponential backoff on rate limits."""
     return api.list_repo_files(**kwargs)
