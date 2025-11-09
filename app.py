@@ -118,7 +118,8 @@ def backoff_handler(details):
     """Handler to print retry attempt information."""
     wait_time = details['wait']
     tries = details['tries']
-    print(f"   ⏳ Rate limited. Retrying in {wait_time:.1f}s (attempt {tries}/8)...")
+    wait_minutes = wait_time / 60
+    print(f"   ⏳ Rate limited. Retrying in {wait_minutes:.1f} minutes ({wait_time:.0f}s) - attempt {tries}/8...")
 
 
 @backoff.on_exception(
@@ -126,6 +127,8 @@ def backoff_handler(details):
     HfHubHTTPError,
     giveup=lambda e: not is_rate_limit_error(e),
     max_tries=8,
+    base=300,  # Start at 5 minutes (300 seconds)
+    max_value=3600,  # Cap at 60 minutes (3600 seconds)
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
@@ -139,6 +142,8 @@ def upload_large_folder_with_backoff(api, **kwargs):
     HfHubHTTPError,
     giveup=lambda e: not is_rate_limit_error(e),
     max_tries=8,
+    base=300,  # Start at 5 minutes (300 seconds)
+    max_value=3600,  # Cap at 60 minutes (3600 seconds)
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
@@ -152,6 +157,8 @@ def list_repo_files_with_backoff(api, **kwargs):
     HfHubHTTPError,
     giveup=lambda e: not is_rate_limit_error(e),
     max_tries=8,
+    base=300,  # Start at 5 minutes (300 seconds)
+    max_value=3600,  # Cap at 60 minutes (3600 seconds)
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
@@ -165,6 +172,8 @@ def hf_hub_download_with_backoff(**kwargs):
     HfHubHTTPError,
     giveup=lambda e: not is_rate_limit_error(e),
     max_tries=8,
+    base=300,  # Start at 5 minutes (300 seconds)
+    max_value=3600,  # Cap at 60 minutes (3600 seconds)
     jitter=backoff.full_jitter,
     on_backoff=backoff_handler
 )
