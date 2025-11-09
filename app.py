@@ -1225,10 +1225,10 @@ def construct_leaderboard_from_metadata():
         agent_name = agent.get('name', 'Unknown')
 
         # Filter metadata for this agent
-        agent_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]
+        bot_metadata = [pr for pr in all_metadata if pr.get('agent_identifier') == identifier]
 
         # Calculate stats
-        stats = calculate_pr_stats_from_metadata(agent_metadata)
+        stats = calculate_pr_stats_from_metadata(bot_metadata)
 
         cache_dict[identifier] = {
             'name': agent_name,
